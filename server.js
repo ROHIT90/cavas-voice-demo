@@ -1,70 +1,112 @@
 import express from "express";
+import OpenAI from "openai";
+import twilio from "twilio";
 
 const app = express();
 
-// Twilio sends form-urlencoded by default
+// Twilio sends form-encoded body by default
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
-// Health check
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+function absoluteUrl(req, path) {
+  // Render sets x-forwarded-proto, x-forwarded-host
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${proto}://${host}${path}`;
+}
+
 app.get("/", (req, res) => {
   res.send("Cavas Voice Demo is running ✅");
 });
 
-// (Optional) so your browser doesn't show "Cannot GET /welcome"
-app.get("/welcome", (req, res) => {
-  res.send("OK ✅ Use POST /welcome from Twilio");
-});
+/**
+ * Twilio Voice webhook (POST)
+ * Configure your Twilio number "A call comes in" -> Webhook -> POST -> https://.../welcome
+ */
+app.post("/welcome", async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
 
-// ✅ Twilio entrypoint (set this in Twilio Voice -> A call comes in)
-app.post("/welcome", (req, res) => {
+  const gather = twiml.gather({
+    input: "speech",
+    language: "en-US",
+    speechTimeout: "auto",
+    action: absoluteUrl(req, "/handle-input"), // IMPORTANT: absolute URL to your server
+    method: "POST",
+  });
+
+  gather.say(
+    { voice: "alice", language: "en-US" },
+    "Hello! Welcome to Cavas AI admissions assistant. Please ask your question about admissions."
+  );
+
+  // If user stays silent, loop back
+  twiml.redirect({ method: "POST" }, absoluteUrl(req, "/welcome"));
+
   res.type("text/xml");
-  res.send(`
-<Response>
-  <Gather input="speech" language="en-US" speechTimeout="auto" action="/handle-input" method="POST">
-    <Say voice="alice" language="en-US">
-      Hello! Welcome to Cavas AI admissions assistant. Please ask your question about admissions.
-    </Say>
-  </Gather>
-  <Redirect>/welcome</Redirect>
-</Response>
-  `.trim());
+  res.send(twiml.toString());
 });
 
-// ✅ Receives speech text from Twilio
-app.post("/handle-input", (req, res) => {
-  const userSpeech = (req.body.SpeechResult || "").toLowerCase();
+/**
+ * Handles the user's speech result. Twilio posts SpeechResult in form data.
+ */
+app.post("/handle-input", async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
 
-  let reply = "Sorry, I didn’t catch that. Please ask about fees, eligibility, MBA, or application process.";
+  const userText = (req.body?.SpeechResult || "").trim();
 
-  if (userSpeech.includes("mba")) {
-    reply = "We offer a two year MBA program with specializations in International Business, Marketing, and Finance.";
-  } else if (userSpeech.includes("fee")) {
-    reply = "The approximate fees are three point five lakh rupees per year.";
-  } else if (userSpeech.includes("eligib")) {
-    reply = "Eligibility is graduation from a recognized university and qualifying the entrance exam.";
-  } else if (userSpeech.includes("apply") || userSpeech.includes("application")) {
-    reply = "You can apply online through the university website. The application process typically starts in January.";
-  } else if (userSpeech.trim().length > 0) {
-    reply = `You asked: ${req.body.SpeechResult}. For admissions, you can ask about fees, eligibility, or how to apply.`;
+  if (!userText) {
+    twiml.say(
+      { voice: "alice", language: "en-US" },
+      "Sorry, I didn't catch that. Please repeat your question."
+    );
+    twiml.redirect({ method: "POST" }, absoluteUrl(req, "/welcome"));
+    res.type("text/xml");
+    return res.send(twiml.toString());
   }
 
-  res.type("text/xml");
-  res.send(`
-<Response>
-  <Say voice="alice" language="en-US">${escapeXml(reply)}</Say>
-  <Redirect>/welcome</Redirect>
-</Response>
-  `.trim());
-});
+  // Give Twilio a small filler while OpenAI responds
+  twiml.say({ voice: "alice", language: "en-US" }, "Got it. One moment.");
 
-function escapeXml(str = "") {
-  return str
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
-}
+  try {
+    // Simple “real AI” answer. You can tighten with your own KB rules later.
+    const system = `
+You are Cavas AI admissions assistant.
+Answer clearly and briefly (2-5 sentences).
+If the user asks something you don't know, ask 1-2 follow-up questions.
+Do NOT invent exact dates or fees. If needed, say "Please confirm on the official website".
+`;
+
+    const response = await client.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        { role: "system", content: system.trim() },
+        { role: "user", content: userText },
+      ],
+    });
+
+    const answer =
+      response.output_text?.trim() ||
+      "Thanks. Could you please share which program and which intake year you're asking about?";
+
+    twiml.say({ voice: "alice", language: "en-US" }, answer);
+  } catch (err) {
+    console.error("OpenAI error:", err?.message || err);
+    twiml.say(
+      { voice: "alice", language: "en-US" },
+      "Sorry, I'm having trouble connecting to the knowledge service. Please try again in a moment."
+    );
+  }
+
+  // Keep the conversation going
+  twiml.redirect({ method: "POST" }, absoluteUrl(req, "/welcome"));
+
+  res.type("text/xml");
+  res.send(twiml.toString());
+});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Listening on", port));
