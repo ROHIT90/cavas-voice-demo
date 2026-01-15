@@ -1,12 +1,14 @@
 {
   "name": "cavas-voice-demo",
-  "private": true,
+  "version": "1.0.0",
   "type": "module",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "openai": "^4.0.0",
+    "twilio": "^4.23.0"
   }
 }
-  
