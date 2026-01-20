@@ -1,20 +1,17 @@
 import express from "express";
 import twilio from "twilio";
 import axios from "axios";
+import OpenAI from "openai";
 
 const app = express();
-
-// Twilio sends form-encoded POST bodies
 app.use(express.urlencoded({ extended: false }));
 
-const baseUrl = "https://cavas-voice-demo.onrender.com"; // keep https
+const baseUrl = "https://cavas-voice-demo.onrender.com";
 
-// Health check
-app.get("/", (req, res) => {
-  res.send("Cavas Voice Demo is running ✅");
-});
+// ---- OpenAI client ----
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// -------- ElevenLabs helper --------
+// ---- ElevenLabs TTS helper ----
 async function elevenTTS(text) {
   if (!process.env.ELEVEN_API_KEY) throw new Error("Missing ELEVEN_API_KEY");
   if (!process.env.ELEVEN_VOICE_ID) throw new Error("Missing ELEVEN_VOICE_ID");
@@ -29,32 +26,64 @@ async function elevenTTS(text) {
     },
     data: {
       text,
-      model_id: "eleven_monolingual_v1",
+      model_id: "eleven_turbo_v2_5",
       voice_settings: { stability: 0.5, similarity_boost: 0.75 },
     },
     responseType: "arraybuffer",
+    timeout: 30000,
   });
 
   return Buffer.from(r.data);
 }
 
-// This endpoint returns MP3 audio for Twilio <Play>
+// Serve audio for Twilio <Play>
 app.get("/tts", async (req, res) => {
   try {
     const text = (req.query.text || "").toString();
     if (!text) return res.status(400).send("Missing text");
 
     const audio = await elevenTTS(text);
-
     res.set("Content-Type", "audio/mpeg");
+    res.set("Cache-Control", "no-store");
     res.send(audio);
   } catch (err) {
-    console.error("TTS error:", err?.response?.data || err.message);
+    console.error("TTS error:", err?.response?.status, err?.response?.data || err.message);
     res.status(500).send("TTS failed");
   }
 });
 
-// IMPORTANT: Twilio will POST to this URL when a call comes in
+// Health check
+app.get("/", (req, res) => res.send("Cavas Voice Demo is running ✅"));
+
+// ---- OpenAI answer ----
+async function getAIAnswer(userSpeech) {
+  if (!process.env.OPENAI_API_KEY) {
+    return "OpenAI is not configured yet. Please add OPENAI_API_KEY in Render environment variables.";
+  }
+
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  const system =
+    "You are Cavas AI admissions assistant. Answer clearly in 1 to 3 sentences. " +
+    "If the user asks something unrelated to admissions, bring them back to admissions. " +
+    "If you don't know, ask one clarification question.";
+
+  const completion = await openai.chat.completions.create({
+    model,
+    temperature: 0.3,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: userSpeech },
+    ],
+  });
+
+  return (
+    completion.choices?.[0]?.message?.content?.trim() ||
+    "Sorry, I couldn't generate an answer. Please repeat your question."
+  );
+}
+
+// ---- Twilio welcome ----
 app.post("/welcome", (req, res) => {
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const twiml = new VoiceResponse();
@@ -67,52 +96,54 @@ app.post("/welcome", (req, res) => {
     method: "POST",
   });
 
-  // Use ElevenLabs by playing audio from our /tts endpoint
   const welcomeText =
     "Hello! Welcome to Cavas AI admissions assistant. Please ask your question about admissions, courses, eligibility, fees, or application.";
 
   gather.play(`${baseUrl}/tts?text=${encodeURIComponent(welcomeText)}`);
 
-  // Loop if user says nothing
   twiml.redirect({ method: "POST" }, `${baseUrl}/welcome`);
 
   res.type("text/xml");
   res.send(twiml.toString());
 });
 
-// Twilio will POST recognized speech here
-app.post("/handle-input", (req, res) => {
+// ---- Twilio handle speech -> OpenAI -> ElevenLabs -> Twilio Play ----
+app.post("/handle-input", async (req, res) => {
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const twiml = new VoiceResponse();
 
-  const userSpeech = req.body.SpeechResult || "";
-  const text = userSpeech.toLowerCase();
+  try {
+    const userSpeech = (req.body.SpeechResult || "").trim();
 
-  let reply =
-    "Sorry, I didn't catch that. Please ask about admissions, courses, eligibility, fees, or application.";
+    if (!userSpeech) {
+      const retryText = "Sorry, I didn't catch that. Please repeat your question.";
+      twiml.play(`${baseUrl}/tts?text=${encodeURIComponent(retryText)}`);
+      twiml.redirect({ method: "POST" }, `${baseUrl}/welcome`);
+      res.type("text/xml");
+      return res.send(twiml.toString());
+    }
 
-  if (text.includes("mba")) {
-    reply =
-      "We offer a two year MBA program with specializations in International Business, Marketing, and Finance.";
-  } else if (text.includes("fee")) {
-    reply =
-      "The approximate fees for the MBA program are three point five lakh rupees per year.";
-  } else if (text.includes("eligibility")) {
-    reply =
-      "Eligibility is graduation from a recognized university and a valid entrance exam score.";
-  } else if (text.includes("application") || text.includes("apply")) {
-    reply =
-      "You can apply online through the university website. The application process usually starts in January.";
+    // small "thinking" line (feels real)
+    const thinking = "Got it. Let me check that quickly.";
+    twiml.play(`${baseUrl}/tts?text=${encodeURIComponent(thinking)}`);
+
+    const answer = await getAIAnswer(userSpeech);
+
+    twiml.play(`${baseUrl}/tts?text=${encodeURIComponent(answer)}`);
+
+    // loop again
+    twiml.redirect({ method: "POST" }, `${baseUrl}/welcome`);
+
+    res.type("text/xml");
+    return res.send(twiml.toString());
+  } catch (err) {
+    console.error("handle-input error:", err?.message || err);
+    const failText = "Sorry, there was a technical issue. Please try again.";
+    twiml.play(`${baseUrl}/tts?text=${encodeURIComponent(failText)}`);
+    twiml.redirect({ method: "POST" }, `${baseUrl}/welcome`);
+    res.type("text/xml");
+    return res.send(twiml.toString());
   }
-
-  // Play ElevenLabs audio
-  twiml.play(`${baseUrl}/tts?text=${encodeURIComponent(reply)}`);
-
-  // Ask again (loop)
-  twiml.redirect({ method: "POST" }, `${baseUrl}/welcome`);
-
-  res.type("text/xml");
-  res.send(twiml.toString());
 });
 
 const port = process.env.PORT || 3000;
