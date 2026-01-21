@@ -8,12 +8,12 @@ app.use(express.urlencoded({ extended: false }));
 
 const baseUrl = "https://cavas-voice-demo.onrender.com";
 
-// ---- OpenAI ----
+// ---------- OpenAI ----------
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ---- In-memory stores ----
+// ---------- Memory Stores ----------
 const convoStore = new Map();      // CallSid -> last 10 messages
 const transcriptStore = new Map(); // CallSid -> full transcript
 
@@ -25,7 +25,7 @@ function pushHistory(callSid, role, content) {
   if (!callSid) return;
   const arr = convoStore.get(callSid) || [];
   arr.push({ role, content });
-  while (arr.length > 10) arr.shift();
+  while (arr.length > 10) arr.shift(); // last 5 exchanges
   convoStore.set(callSid, arr);
 }
 
@@ -40,7 +40,7 @@ function getTranscript(callSid) {
   return transcriptStore.get(callSid) || [];
 }
 
-// ---- ElevenLabs TTS ----
+// ---------- ElevenLabs TTS ----------
 async function elevenTTS(text) {
   const r = await axios({
     method: "POST",
@@ -63,20 +63,21 @@ async function elevenTTS(text) {
 
 app.get("/tts", async (req, res) => {
   try {
-    const text = req.query.text;
-    const audio = await elevenTTS(text);
+    const audio = await elevenTTS(req.query.text);
     res.set("Content-Type", "audio/mpeg");
     res.set("Cache-Control", "no-store");
     res.send(audio);
-  } catch (e) {
+  } catch {
     res.status(500).send("TTS failed");
   }
 });
 
-// ---- Health ----
-app.get("/", (_, res) => res.send("Cavas Voice Demo is running ✅"));
+// ---------- Health ----------
+app.get("/", (_, res) =>
+  res.send("Cavas Voice Demo is running ✅")
+);
 
-// ---- AI Answer ----
+// ---------- AI Answer ----------
 async function getAIAnswer(callSid, userText) {
   const history = getHistory(callSid);
 
@@ -107,12 +108,9 @@ async function getAIAnswer(callSid, userText) {
   return answer;
 }
 
-// ---- Welcome ----
+// ---------- Welcome ----------
 app.post("/welcome", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
-  const callSid = req.body.CallSid;
-
-  console.log("Incoming call:", callSid);
 
   const gather = twiml.gather({
     input: "speech",
@@ -129,38 +127,19 @@ app.post("/welcome", (req, res) => {
     )}`
   );
 
-  res.type("text/xml");
-  res.send(twiml.toString());
+  res.type("text/xml").send(twiml.toString());
 });
 
-// ---- Handle first + next questions ----
+// ---------- First + Next ----------
 app.post("/handle-input", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const callSid = req.body.CallSid;
   const speech = (req.body.SpeechResult || "").trim();
 
   if (!speech) {
-    const retry = twiml.gather({
-      input: "speech",
-      bargeIn: true,
-      language: "en-US",
-      action: `${baseUrl}/handle-input`,
-      method: "POST",
-    });
-
-    retry.play(
-      `${baseUrl}/tts?text=${encodeURIComponent(
-        "Sorry, I didn't catch that. Please repeat your question."
-      )}`
-    );
-
-    res.type("text/xml");
-    return res.send(twiml.toString());
+    twiml.redirect({ method: "POST" }, `${baseUrl}/welcome`);
+    return res.type("text/xml").send(twiml.toString());
   }
-
-  twiml.play(
-    `${baseUrl}/tts?text=${encodeURIComponent("Got it. One moment.")}`
-  );
 
   const answer = await getAIAnswer(callSid, speech);
   twiml.play(`${baseUrl}/tts?text=${encodeURIComponent(answer)}`);
@@ -176,21 +155,20 @@ app.post("/handle-input", async (req, res) => {
 
   gather.play(
     `${baseUrl}/tts?text=${encodeURIComponent(
-      "Would you like to ask another question? You can ask now, or say no."
+      "Would you like to ask another question? You can ask now or say no."
     )}`
   );
 
-  res.type("text/xml");
-  res.send(twiml.toString());
+  res.type("text/xml").send(twiml.toString());
 });
 
-// ---- Follow-up ----
+// ---------- Follow-up ----------
 app.post("/handle-followup", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const callSid = req.body.CallSid;
   const speech = (req.body.SpeechResult || "").trim().toLowerCase();
 
-  if (!speech) {
+  if (!speech || ["no", "bye", "thanks", "thank you"].some(w => speech.includes(w))) {
     twiml.play(
       `${baseUrl}/tts?text=${encodeURIComponent(
         "Thank you for calling. Goodbye."
@@ -199,28 +177,6 @@ app.post("/handle-followup", async (req, res) => {
     twiml.hangup();
     return res.type("text/xml").send(twiml.toString());
   }
-
-  const noWords = ["no", "nope", "bye", "thanks", "thank you"];
-  if (noWords.some((w) => speech.includes(w))) {
-    twiml.play(
-      `${baseUrl}/tts?text=${encodeURIComponent(
-        "Thank you for calling. Goodbye."
-      )}`
-    );
-    twiml.hangup();
-
-    console.log(
-      "Call summary:",
-      `${baseUrl}/call-summary?callSid=${callSid}`
-    );
-
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  // Treat as next question
-  twiml.play(
-    `${baseUrl}/tts?text=${encodeURIComponent("Sure. One moment.")}`
-  );
 
   const answer = await getAIAnswer(callSid, speech);
   twiml.play(`${baseUrl}/tts?text=${encodeURIComponent(answer)}`);
@@ -240,20 +196,20 @@ app.post("/handle-followup", async (req, res) => {
     )}`
   );
 
-  res.type("text/xml");
-  res.send(twiml.toString());
+  res.type("text/xml").send(twiml.toString());
 });
 
-// ---- Call summary ----
-app.get("/call-summary", async (req, res) => {
-  const callSid = req.query.callSid;
+// ---------- Call Summary ----------
+app.get("/call-summary/:callSid", async (req, res) => {
+  const { callSid } = req.params;
   const transcript = getTranscript(callSid);
 
-  if (!transcript.length)
+  if (!transcript.length) {
     return res.status(404).json({ error: "No transcript found" });
+  }
 
   const text = transcript
-    .map((x) => `${x.role.toUpperCase()}: ${x.content}`)
+    .map(x => `${x.role.toUpperCase()}: ${x.content}`)
     .join("\n");
 
   const completion = await openai.chat.completions.create({
@@ -276,5 +232,8 @@ app.get("/call-summary", async (req, res) => {
   });
 });
 
+// ---------- Start ----------
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Listening on", port));
+app.listen(port, () =>
+  console.log("Listening on", port)
+);
