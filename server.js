@@ -631,7 +631,7 @@ async function getAIAnswerHospital(callSid, userText) {
     // ✅ FIX: better phrasing: list doctors then ask which one
     setSession(callSid, { state: "ASK_BOOK_OR_LIST_MORE", data: { dept } });
     const names = docs.slice(0, 3).map((d, i) => `${d.name} (${i + 1})`).join(", ");
-    const say = await hospitalPolish(callSid, `${dept} doctors include ${names}. Which one would you like to book? You can say the doctor’s name or the number.`);
+    const say = await hospitalPolish(callSid, `${dept} doctors include ${names}. Which one would you like to book? You can say the doctor’s name.`);
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
   }
