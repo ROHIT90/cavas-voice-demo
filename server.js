@@ -389,13 +389,13 @@ function extractPhone(text) {
 function detectDept(text) {
   const t = normalize(text);
   const aliases = [
-    { k: ["cardio", "cardiology", "cardiologist", "heart", "heart doctor", "dil", "dil ka", "dil ka doctor"], v: "Cardiology" },
-    { k: ["ortho", "orthopedic", "orthopedics", "bones", "bone", "haddi", "haddi ka", "joint"], v: "Orthopedics" },
-    { k: ["ent", "ear", "nose", "throat", "kaan", "naak", "gala"], v: "ENT" },
-    { k: ["neuro", "neurology", "brain", "dimaag"], v: "Neurology" },
+    { k: ["cardio", "cardiology", "heart", "cardiologist"], v: "Cardiology" },
+    { k: ["ortho", "orthopedic", "orthopedics", "bones", "bone"], v: "Orthopedics" },
+    { k: ["ent", "ear", "nose", "throat"], v: "ENT" },
+    { k: ["neuro", "neurology", "brain"], v: "Neurology" },
     { k: ["onco", "oncology", "cancer"], v: "Oncology" },
-    { k: ["derma", "dermatology", "skin", "twacha", "skin doctor"], v: "Dermatology" },
-    { k: ["gastro", "gastroenterology", "stomach", "pet", "gas"], v: "Gastroenterology" },
+    { k: ["derma", "dermatology", "skin"], v: "Dermatology" },
+    { k: ["gastro", "gastroenterology", "stomach"], v: "Gastroenterology" },
   ];
   for (const a of aliases) if (a.k.some((kw) => t.includes(kw))) return a.v;
   const direct = DEPARTMENTS.find((d) => t.includes(normalize(d)));
@@ -405,29 +405,67 @@ function detectDept(text) {
 function listDoctorsByDept(dept, location = "Gurgaon") {
   return DOCTORS.filter((x) => normalize(x.dept) === normalize(dept) && normalize(x.location) === normalize(location));
 }
+
 function findDoctorByName(query) {
   const q = normalize(query).replace(/^dr\.?\s*/i, "");
   if (!q) return [];
   return DOCTORS.filter((d) => normalize(d.name).includes(q)).slice(0, 5);
 }
+
 function wantsHuman(text) {
   const t = normalize(text);
   return ["human","agent","representative","operator","real person","connect me","transfer","talk to someone","call center","agent se","representative se","human se"].some((k) => t.includes(k));
 }
+
 function looksLikeMedicalAdvice(text) {
   const t = normalize(text);
   const risky = ["fever","pain","chest pain","breath","bp","blood pressure","diagnose","diagnosis","treatment","medicine","tablet","dose","emergency","vomit","bleeding","pregnant","pregnancy","heart attack","stroke","bukhar","dard","saans","dabav","dawai","emergency"];
   return risky.some((k) => t.includes(k));
 }
+
 function pickSlots(d) {
   const slots = (d.nextSlots || []).slice(0, 3);
   return slots.length ? `Next available: ${slots.join(", ")}.` : "Next available slots will be shared by the booking team.";
 }
 
-// NEW: format options as "1. Dr A  2. Dr B  3. Dr C"
-function doctorOptionsLine(docs) {
-  const top = docs.slice(0, 3);
-  return top.map((d, i) => `${i + 1}. ${d.name}`).join("  ");
+// ✅ FIX: extract name if user says "Patient name X" or "My name is X"
+function extractPatientNameUtterance(text) {
+  const raw = String(text || "").trim();
+  const m1 = raw.match(/patient\s*name\s*(is)?\s*[:\-]?\s*(.+)$/i);
+  if (m1?.[2]) return m1[2].trim();
+
+  const m2 = raw.match(/\bmy\s*name\s*(is)?\s*[:\-]?\s*(.+)$/i);
+  if (m2?.[2]) return m2[2].trim();
+
+  // If user gave "Tomorrow 12 pm. Rohit Narwal" we try to remove obvious time prefix
+  const m3 = raw.match(/^(tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b[^\w]*(.+)$/i);
+  if (m3?.[2] && m3[2].length >= 2) return m3[2].trim();
+
+  return raw;
+}
+
+// ✅ FIX: extract preferred time from early utterances (tomorrow 12 pm, tomorrow evening, Friday morning etc.)
+function extractPreferredTime(text) {
+  const raw = String(text || "").trim();
+  const t = normalize(raw);
+
+  const timeWords = ["morning", "evening", "afternoon", "night", "a.m.", "p.m.", "am", "pm"];
+  const dayWords = ["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+
+  const hasDay = dayWords.some((d) => t.includes(d));
+  const hasTimeWord = timeWords.some((w) => t.includes(w));
+  const hasClock = /\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)\b/i.test(raw) || /\b\d{1,2}(:\d{2})\b/.test(raw);
+
+  if (!(hasDay || hasTimeWord || hasClock)) return null;
+
+  // pull a compact chunk: "tomorrow 12:00 p.m." / "tomorrow evening" / "friday morning"
+  const m =
+    raw.match(/\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b[^.]{0,40}/i) ||
+    raw.match(/\b(morning|evening|afternoon|night)\b/i);
+
+  const out = (m?.[0] || raw).trim();
+  // avoid returning full sentence if it contains "patient name"
+  return out.replace(/patient\s*name.*$/i, "").trim();
 }
 
 // IMPORTANT: For demo reliability, polish ONLY non-sensitive lines.
@@ -473,6 +511,28 @@ async function hospitalPolish(callSid, raw) {
   }
 }
 
+// ✅ FIX: build confirmation using ONE time (preferredTime)
+async function buildConfirmation(callSid, preferredTimeOverride = null) {
+  const session = getSession(callSid);
+  const { patientName, phone, doctorName, dept } = session.data || {};
+
+  const preferredTime = (preferredTimeOverride || session.data?.preferredTime || "").trim();
+  const confirmationId = `APT-${Math.random().toString(16).slice(2, 8).toUpperCase()}`;
+
+  setSession(callSid, { state: "CONFIRMED", data: { preferredTime, confirmationId } });
+
+  const base =
+    `Done. I’ve raised an appointment request for ${patientName || "the patient"} ` +
+    `${doctorName ? `with ${doctorName}` : ""}${dept ? ` in ${dept}` : ""}. ` +
+    `${preferredTime ? `Preferred time: ${preferredTime}. ` : ""}` +
+    `Confirmation ID is ${confirmationId}. ` +
+    `You will receive confirmation on ${phone || "your number"}.`;
+
+  const say = await hospitalPolish(callSid, base);
+  pushTranscript(callSid, "assistant", say);
+  return { say, transfer: false };
+}
+
 async function getAIAnswerHospital(callSid, userText) {
   const session = getSession(callSid);
   const t = userText.trim();
@@ -486,9 +546,20 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, transfer: true };
   }
 
+  // -----------------------
   // State machine
+  // -----------------------
+
+  // ✅ FIX: user might give time + name together here
   if (session.state === "COLLECT_NAME") {
-    setSession(callSid, { state: "COLLECT_PHONE", data: { patientName: t } });
+    const patientName = extractPatientNameUtterance(t);
+    const earlyTime = extractPreferredTime(t);
+
+    setSession(callSid, {
+      state: "COLLECT_PHONE",
+      data: { patientName, ...(earlyTime ? { preferredTime: earlyTime } : {}) },
+    });
+
     const say = await hospitalPolish(callSid, "Thanks. Please tell me your 10-digit mobile number for confirmation.");
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
@@ -501,28 +572,29 @@ async function getAIAnswerHospital(callSid, userText) {
       pushTranscript(callSid, "assistant", say);
       return { say, transfer: false };
     }
-    setSession(callSid, { state: "COLLECT_TIME", data: { phone } });
+
+    setSession(callSid, { data: { phone } });
+
+    // ✅ FIX: if we already have preferredTime from earlier, confirm now (don’t ask time again)
+    const alreadyTime = (getSession(callSid).data?.preferredTime || "").trim();
+    if (alreadyTime) {
+      return buildConfirmation(callSid, alreadyTime);
+    }
+
+    setSession(callSid, { state: "COLLECT_TIME" });
     const say = await hospitalPolish(callSid, "Great. What day or time do you prefer? For example, tomorrow evening or Friday morning.");
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
   }
 
   if (session.state === "COLLECT_TIME") {
-    const confirmationId = `APT-${Math.random().toString(16).slice(2, 8).toUpperCase()}`;
-    const { patientName, phone, doctorName, dept } = session.data || {};
-    setSession(callSid, { state: "CONFIRMED", data: { preferredTime: t, confirmationId } });
-
-    const base =
-      `Done. I’ve raised an appointment request for ${patientName || "the patient"} ` +
-      `${doctorName ? `with ${doctorName}` : dept ? `in ${dept}` : ""}. ` +
-      `Preferred time: ${t}. Confirmation ID is ${confirmationId}. ` +
-      `You will receive confirmation on ${phone || "your number"}.`;
-
-    const say = await hospitalPolish(callSid, base);
-    pushTranscript(callSid, "assistant", say);
-    return { say, transfer: false };
+    // ✅ latest time wins
+    return buildConfirmation(callSid, t);
   }
 
+  // -----------------------
+  // Routing logic
+  // -----------------------
   const dept = detectDept(t);
   const hasDr = norm.includes("dr ") || norm.includes("dr.") || norm.includes("doctor ");
 
@@ -548,22 +620,37 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, transfer: false };
   }
 
-  // If we already asked options earlier, handle that FIRST (numbers or name)
-  if (session.state === "ASK_BOOK_OR_LIST_MORE") {
-    const deptInSession = session.data?.dept;
-    const docs = deptInSession ? listDoctorsByDept(deptInSession, "Gurgaon") : [];
-
-    // If user says a number (1/2/3)
-    const n = parseInt(String(t).trim(), 10);
-    if (!Number.isNaN(n) && n >= 1 && n <= Math.min(3, docs.length)) {
-      const d = docs[n - 1];
-      setSession(callSid, { state: "COLLECT_NAME", data: { doctorName: d.name, dept: d.dept } });
-      const say = await hospitalPolish(callSid, `Sure. ${d.name}. ${pickSlots(d)} To book, please tell me the patient’s full name.`);
+  if (dept) {
+    const docs = listDoctorsByDept(dept, "Gurgaon");
+    if (!docs.length) {
+      const say = await hospitalPolish(callSid, `I don’t have doctors listed for ${dept} right now. Would you like to connect to an agent?`);
       pushTranscript(callSid, "assistant", say);
       return { say, transfer: false };
     }
 
-    // Otherwise match by name
+    // ✅ FIX: better phrasing: list doctors then ask which one
+    setSession(callSid, { state: "ASK_BOOK_OR_LIST_MORE", data: { dept } });
+    const names = docs.slice(0, 3).map((d, i) => `${d.name} (${i + 1})`).join(", ");
+    const say = await hospitalPolish(callSid, `${dept} doctors include ${names}. Which one would you like to book? You can say the doctor’s name or the number.`);
+    pushTranscript(callSid, "assistant", say);
+    return { say, transfer: false };
+  }
+
+  if (session.state === "ASK_BOOK_OR_LIST_MORE") {
+    // allow "1" / "2" selection too
+    const num = parseInt(norm, 10);
+    if (!Number.isNaN(num)) {
+      const dept = session.data?.dept;
+      const docs = dept ? listDoctorsByDept(dept, "Gurgaon") : [];
+      const d = docs[num - 1];
+      if (d) {
+        setSession(callSid, { state: "COLLECT_NAME", data: { doctorName: d.name, dept: d.dept } });
+        const say = await hospitalPolish(callSid, `Sure. ${d.name}. ${pickSlots(d)} To book, please tell me the patient’s full name.`);
+        pushTranscript(callSid, "assistant", say);
+        return { say, transfer: false };
+      }
+    }
+
     const matches = findDoctorByName(t);
     if (matches.length === 1) {
       const d = matches[0];
@@ -573,41 +660,12 @@ async function getAIAnswerHospital(callSid, userText) {
       return { say, transfer: false };
     }
 
-    const say = await hospitalPolish(
-      callSid,
-      "Please say the doctor name or the option number (1, 2, or 3). You can also say ‘agent’ to connect to a human representative."
-    );
+    const say = await hospitalPolish(callSid, "Please say the full doctor name (or 1/2), or say ‘agent’ to connect to a human representative.");
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
   }
 
-  if (dept) {
-    const docs = listDoctorsByDept(dept, "Gurgaon");
-    if (!docs.length) {
-      const say = await hospitalPolish(callSid, `I don’t have doctors listed for ${dept} right now. Would you like to connect to an agent?`);
-      pushTranscript(callSid, "assistant", say);
-      return { say, transfer: false };
-    }
-
-    setSession(callSid, { state: "ASK_BOOK_OR_LIST_MORE", data: { dept } });
-
-    const lang = getSttLang(callSid);
-    const options = doctorOptionsLine(docs);
-
-    const rawPrompt =
-      lang === "hi-IN"
-        ? `${dept} ke liye hamare paas ye doctors hain: ${options}. Aap kisko book karna chahenge? Aap number bol sakte hain—jaise 1, 2, ya 3.`
-        : `For ${dept}, we have these doctors: ${options}. Which one would you like to book? You can say the number—like 1, 2, or 3.`;
-
-    const say = await hospitalPolish(callSid, rawPrompt);
-    pushTranscript(callSid, "assistant", say);
-    return { say, transfer: false };
-  }
-
-  const say = await hospitalPolish(
-    callSid,
-    `I can help with appointments at ${HOSPITAL_NAME}. Say a department like cardiology, or say Dr followed by the doctor’s name, or say agent.`
-  );
+  const say = await hospitalPolish(callSid, `I can help with appointments at ${HOSPITAL_NAME}. Say a department like cardiology, or say Dr followed by the doctor’s name, or say agent.`);
   pushTranscript(callSid, "assistant", say);
   return { say, transfer: false };
 }
@@ -647,7 +705,6 @@ app.post("/welcome", (req, res) => {
     const mode = modeFromQuery === "hospital" || modeFromQuery === "education" ? modeFromQuery : MODE;
 
     rememberCall(callSid, { ts: new Date().toISOString(), from, to, mode });
-
     setSession(callSid, { mode, state: "NEW", lang: mode === "hospital" ? "en-IN" : null, data: {} });
 
     const greeting =
@@ -789,11 +846,19 @@ app.post("/handle-followup", async (req, res) => {
 // =========================================================
 app.get("/calls", (req, res) => {
   const sids = [...new Set([...recentCalls, ...Object.keys(persisted)])].slice(0, 20);
-  const out = sids.map((sid) => ({
-    callSid: sid,
-    ...(persisted?.[sid]?.meta || callMetaStore.get(sid) || {}),
-    transcriptCount: (persisted?.[sid]?.transcript || getTranscript(sid) || []).length,
-  }));
+  const out = sids.map((sid) => {
+    const meta = (persisted?.[sid]?.meta || callMetaStore.get(sid) || {});
+    return {
+      callSid: sid,
+      ...meta,
+      transcriptCount: (persisted?.[sid]?.transcript || getTranscript(sid) || []).length,
+      // ✅ FIX: expose URLs so “transcript url missing” is solved
+      uiUrl: `${BASE_URL}/ui/${sid}`,
+      transcriptUrl: `${BASE_URL}/transcript/${sid}`,
+      summaryUrl: `${BASE_URL}/call-summary/${sid}`,
+      liveUrl: `${BASE_URL}/live/${sid}`,
+    };
+  });
   res.json({ count: out.length, calls: out });
 });
 
@@ -804,6 +869,10 @@ app.get("/transcript/:callSid", (req, res) => {
   res.json({
     callSid,
     ...(persisted?.[callSid]?.meta || callMetaStore.get(callSid) || {}),
+    uiUrl: `${BASE_URL}/ui/${callSid}`,
+    transcriptUrl: `${BASE_URL}/transcript/${callSid}`,
+    summaryUrl: `${BASE_URL}/call-summary/${callSid}`,
+    liveUrl: `${BASE_URL}/live/${callSid}`,
     transcript,
   });
 });
@@ -827,6 +896,10 @@ app.get("/call-summary/:callSid", async (req, res) => {
   res.json({
     callSid,
     ...(persisted?.[callSid]?.meta || callMetaStore.get(callSid) || {}),
+    uiUrl: `${BASE_URL}/ui/${callSid}`,
+    transcriptUrl: `${BASE_URL}/transcript/${callSid}`,
+    summaryUrl: `${BASE_URL}/call-summary/${callSid}`,
+    liveUrl: `${BASE_URL}/live/${callSid}`,
     summary: completion.choices?.[0]?.message?.content,
     transcript,
   });
