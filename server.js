@@ -7,6 +7,10 @@
  *  - Stop OpenAI "polish" during name/phone/time collection
  *  - Persist transcripts to disk so /transcript works even after restart (demo-safe)
  *
+ * LIVE UI (Option A):
+ *  - GET  /ui/:callSid        -> Live transcript web page
+ *  - GET  /live/:callSid      -> SSE stream for live transcript
+ *
  * Endpoints:
  *  - POST /welcome?mode=hospital|education
  *  - POST /handle-input
@@ -14,6 +18,8 @@
  *  - GET  /calls
  *  - GET  /transcript/:callSid
  *  - GET  /call-summary/:callSid
+ *  - GET  /ui/:callSid
+ *  - GET  /live/:callSid
  */
 
 import express from "express";
@@ -65,6 +71,23 @@ const sessionStore = new Map();     // callSid -> { mode, state, lang, data }
 const callMetaStore = new Map();    // callSid -> { ts, mode, lang, from, to }
 const recentCalls = [];             // most recent first, max 20
 
+// ------------------------------
+// LIVE SSE listeners (Option A)
+// callSid -> Set(res)
+// ------------------------------
+const liveListeners = new Map();
+
+function pushLive(callSid, event) {
+  const set = liveListeners.get(callSid);
+  if (!set) return;
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  for (const res of set) {
+    try {
+      res.write(payload);
+    } catch {}
+  }
+}
+
 function rememberCall(callSid, patch = {}) {
   if (!callSid) return;
   const prev = callMetaStore.get(callSid) || { ts: new Date().toISOString() };
@@ -84,14 +107,20 @@ function rememberCall(callSid, patch = {}) {
 
 function pushTranscript(callSid, role, content) {
   if (!callSid) return;
+
+  const item = { ts: new Date().toISOString(), role, content };
+
   const arr = transcriptStore.get(callSid) || [];
-  arr.push({ ts: new Date().toISOString(), role, content });
+  arr.push(item);
   transcriptStore.set(callSid, arr);
 
   // persist
   persisted[callSid] = persisted[callSid] || { meta: {}, transcript: [] };
   persisted[callSid].transcript = arr;
   savePersisted(persisted);
+
+  // live stream to UI
+  pushLive(callSid, { type: "transcript", callSid, item });
 }
 
 function getTranscript(callSid) {
@@ -199,6 +228,118 @@ app.get("/tts", async (req, res) => {
 app.get("/", (_, res) => res.send(`Cavas Voice Demo is running ✅ (MODE=${MODE})`));
 
 // =========================================================
+// LIVE UI + SSE (Option A)
+// =========================================================
+app.get("/live/:callSid", (req, res) => {
+  const { callSid } = req.params;
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const set = liveListeners.get(callSid) || new Set();
+  set.add(res);
+  liveListeners.set(callSid, set);
+
+  // initial transcript
+  const existing = getTranscript(callSid);
+  res.write(`data: ${JSON.stringify({ type: "init", callSid, transcript: existing })}\n\n`);
+
+  req.on("close", () => {
+    const s = liveListeners.get(callSid);
+    if (s) {
+      s.delete(res);
+      if (s.size === 0) liveListeners.delete(callSid);
+    }
+  });
+});
+
+app.get("/ui/:callSid", (req, res) => {
+  const { callSid } = req.params;
+  res.type("html").send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Live Transcript - ${callSid}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; padding:16px; background:#fafafa;}
+    #wrap{max-width:980px; margin:0 auto;}
+    .top{display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:space-between;}
+    .card{background:#fff; border:1px solid #eee; border-radius:14px; padding:14px; box-shadow:0 1px 6px rgba(0,0,0,.05);}
+    .meta{display:flex; gap:10px; flex-wrap:wrap; font-size:14px; color:#333;}
+    .pill{background:#f1f5f9; padding:6px 10px; border-radius:999px;}
+    .links a{margin-right:10px; text-decoration:none; font-weight:600;}
+    .row{padding:10px 12px; border-bottom:1px solid #f0f0f0;}
+    .u{background:#f7fbff;}
+    .a{background:#f7fff7;}
+    .ts{color:#666; font-size:12px;}
+    .role{font-weight:800; margin-right:8px;}
+    #log{margin-top:12px; overflow:auto;}
+    .status{font-size:13px; color:#666;}
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div class="top">
+      <div class="card" style="flex:1;">
+        <div style="font-size:18px; font-weight:800;">Live Transcript</div>
+        <div class="meta" style="margin-top:6px;">
+          <div class="pill"><b>CallSid:</b> ${callSid}</div>
+          <div class="pill status" id="status">Connecting…</div>
+        </div>
+        <div class="links" style="margin-top:10px;">
+          <a href="/transcript/${callSid}" target="_blank">Transcript JSON</a>
+          <a href="/call-summary/${callSid}" target="_blank">Summary JSON</a>
+          <a href="/calls" target="_blank">Calls</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="log"></div>
+  </div>
+
+<script>
+  const log = document.getElementById('log');
+  const statusEl = document.getElementById('status');
+
+  function esc(s){
+    return String(s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  }
+
+  function addLine(item){
+    const div = document.createElement('div');
+    div.className = 'row ' + (item.role === 'user' ? 'u' : 'a');
+    div.innerHTML =
+      '<div class="ts">'+esc(item.ts)+'</div>' +
+      '<div><span class="role">'+esc(item.role.toUpperCase())+':</span>' +
+      '<span>'+ esc(item.content || '') +'</span></div>';
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+    window.scrollTo(0, document.body.scrollHeight);
+  }
+
+  const es = new EventSource('/live/${callSid}');
+  es.onopen = () => statusEl.textContent = "Live connected ✅";
+  es.onerror = () => statusEl.textContent = "Disconnected (refresh page)";
+
+  es.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'init') {
+      log.innerHTML = '';
+      (msg.transcript || []).forEach(addLine);
+    }
+    if (msg.type === 'transcript') addLine(msg.item);
+  };
+</script>
+</body>
+</html>
+  `);
+});
+
+// =========================================================
 // EDUCATION MODE
 // =========================================================
 async function getAIAnswerEducation(callSid, userText) {
@@ -282,7 +423,6 @@ function pickSlots(d) {
 }
 
 // IMPORTANT: For demo reliability, polish ONLY non-sensitive lines.
-// We skip polish when collecting name/phone/time/confirmation to avoid refusals/latency.
 async function hospitalPolish(callSid, raw) {
   const lower = String(raw || "").toLowerCase();
   const skip =
@@ -498,15 +638,15 @@ app.post("/handle-input", async (req, res) => {
     const speech = (req.body.SpeechResult || "").trim();
 
     if (!speech) {
-      // Empty result: prompt again
       const sttLang = getSttLang(callSid);
       const gather = gatherBlock(twiml, callSid, "/handle-followup");
-      const msg = sttLang === "hi-IN" ? "Sorry, aapki awaaz clear nahi aayi. Dobara boliye." : "Sorry, I didn’t catch that. Please say it again.";
+      const msg = sttLang === "hi-IN"
+        ? "Sorry, aapki awaaz clear nahi aayi. Dobara boliye."
+        : "Sorry, I didn’t catch that. Please say it again.";
       gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(msg)}`);
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // auto language switch
     const pref = detectLangPreference(speech);
     if (pref) setSession(callSid, { lang: pref });
 
@@ -528,7 +668,6 @@ app.post("/handle-input", async (req, res) => {
     const mode = (getSession(callSid)?.mode || MODE);
     const gather = gatherBlock(twiml, callSid, "/handle-followup");
 
-    // Education prompt vs hospital prompt
     if (mode === "education") {
       gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Would you like to ask another question? You can ask now or say no.")}`);
     } else {
@@ -554,7 +693,6 @@ app.post("/handle-followup", async (req, res) => {
     const raw = (req.body.SpeechResult || "").trim();
     const speechLower = raw.toLowerCase();
 
-    // auto language switch
     const pref = detectLangPreference(raw);
     if (pref) setSession(callSid, { lang: pref });
 
