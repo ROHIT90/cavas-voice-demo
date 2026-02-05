@@ -385,21 +385,23 @@ function extractPhone(text) {
   const m = t.match(/(\+?\d[\d\s-]{9,}\d)/) || t.match(/(\d{10})/);
   return m ? m[1].replace(/\s|-/g, "") : null;
 }
+
 function detectDept(text) {
   const t = normalize(text);
   const aliases = [
-    { k: ["cardio", "cardiology", "heart"], v: "Cardiology" },
-    { k: ["ortho", "orthopedic", "orthopedics", "bones", "bone"], v: "Orthopedics" },
-    { k: ["ent", "ear", "nose", "throat"], v: "ENT" },
-    { k: ["neuro", "neurology", "brain"], v: "Neurology" },
+    { k: ["cardio", "cardiology", "cardiologist", "heart", "heart doctor", "dil", "dil ka", "dil ka doctor"], v: "Cardiology" },
+    { k: ["ortho", "orthopedic", "orthopedics", "bones", "bone", "haddi", "haddi ka", "joint"], v: "Orthopedics" },
+    { k: ["ent", "ear", "nose", "throat", "kaan", "naak", "gala"], v: "ENT" },
+    { k: ["neuro", "neurology", "brain", "dimaag"], v: "Neurology" },
     { k: ["onco", "oncology", "cancer"], v: "Oncology" },
-    { k: ["derma", "dermatology", "skin"], v: "Dermatology" },
-    { k: ["gastro", "gastroenterology", "stomach"], v: "Gastroenterology" },
+    { k: ["derma", "dermatology", "skin", "twacha", "skin doctor"], v: "Dermatology" },
+    { k: ["gastro", "gastroenterology", "stomach", "pet", "gas"], v: "Gastroenterology" },
   ];
   for (const a of aliases) if (a.k.some((kw) => t.includes(kw))) return a.v;
   const direct = DEPARTMENTS.find((d) => t.includes(normalize(d)));
   return direct || null;
 }
+
 function listDoctorsByDept(dept, location = "Gurgaon") {
   return DOCTORS.filter((x) => normalize(x.dept) === normalize(dept) && normalize(x.location) === normalize(location));
 }
@@ -420,6 +422,12 @@ function looksLikeMedicalAdvice(text) {
 function pickSlots(d) {
   const slots = (d.nextSlots || []).slice(0, 3);
   return slots.length ? `Next available: ${slots.join(", ")}.` : "Next available slots will be shared by the booking team.";
+}
+
+// NEW: format options as "1. Dr A  2. Dr B  3. Dr C"
+function doctorOptionsLine(docs) {
+  const top = docs.slice(0, 3);
+  return top.map((d, i) => `${i + 1}. ${d.name}`).join("  ");
 }
 
 // IMPORTANT: For demo reliability, polish ONLY non-sensitive lines.
@@ -540,6 +548,39 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, transfer: false };
   }
 
+  // If we already asked options earlier, handle that FIRST (numbers or name)
+  if (session.state === "ASK_BOOK_OR_LIST_MORE") {
+    const deptInSession = session.data?.dept;
+    const docs = deptInSession ? listDoctorsByDept(deptInSession, "Gurgaon") : [];
+
+    // If user says a number (1/2/3)
+    const n = parseInt(String(t).trim(), 10);
+    if (!Number.isNaN(n) && n >= 1 && n <= Math.min(3, docs.length)) {
+      const d = docs[n - 1];
+      setSession(callSid, { state: "COLLECT_NAME", data: { doctorName: d.name, dept: d.dept } });
+      const say = await hospitalPolish(callSid, `Sure. ${d.name}. ${pickSlots(d)} To book, please tell me the patient’s full name.`);
+      pushTranscript(callSid, "assistant", say);
+      return { say, transfer: false };
+    }
+
+    // Otherwise match by name
+    const matches = findDoctorByName(t);
+    if (matches.length === 1) {
+      const d = matches[0];
+      setSession(callSid, { state: "COLLECT_NAME", data: { doctorName: d.name, dept: d.dept } });
+      const say = await hospitalPolish(callSid, `Sure. ${d.name}. ${pickSlots(d)} To book, please tell me the patient’s full name.`);
+      pushTranscript(callSid, "assistant", say);
+      return { say, transfer: false };
+    }
+
+    const say = await hospitalPolish(
+      callSid,
+      "Please say the doctor name or the option number (1, 2, or 3). You can also say ‘agent’ to connect to a human representative."
+    );
+    pushTranscript(callSid, "assistant", say);
+    return { say, transfer: false };
+  }
+
   if (dept) {
     const docs = listDoctorsByDept(dept, "Gurgaon");
     if (!docs.length) {
@@ -549,26 +590,24 @@ async function getAIAnswerHospital(callSid, userText) {
     }
 
     setSession(callSid, { state: "ASK_BOOK_OR_LIST_MORE", data: { dept } });
-    const say = await hospitalPolish(callSid, `${dept} doctors include ${docs.slice(0, 3).map((d) => d.name).join(", ")}. To book, say the doctor’s name.`);
+
+    const lang = getSttLang(callSid);
+    const options = doctorOptionsLine(docs);
+
+    const rawPrompt =
+      lang === "hi-IN"
+        ? `${dept} ke liye hamare paas ye doctors hain: ${options}. Aap kisko book karna chahenge? Aap number bol sakte hain—jaise 1, 2, ya 3.`
+        : `For ${dept}, we have these doctors: ${options}. Which one would you like to book? You can say the number—like 1, 2, or 3.`;
+
+    const say = await hospitalPolish(callSid, rawPrompt);
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
   }
 
-  if (session.state === "ASK_BOOK_OR_LIST_MORE") {
-    const matches = findDoctorByName(t);
-    if (matches.length === 1) {
-      const d = matches[0];
-      setSession(callSid, { state: "COLLECT_NAME", data: { doctorName: d.name, dept: d.dept } });
-      const say = await hospitalPolish(callSid, `Sure. ${d.name}. ${pickSlots(d)} To book, please tell me the patient’s full name.`);
-      pushTranscript(callSid, "assistant", say);
-      return { say, transfer: false };
-    }
-    const say = await hospitalPolish(callSid, "Please say the full doctor name to book, or say ‘agent’ to connect to a human representative.");
-    pushTranscript(callSid, "assistant", say);
-    return { say, transfer: false };
-  }
-
-  const say = await hospitalPolish(callSid, `I can help with appointments at ${HOSPITAL_NAME}. Say a department like cardiology, or say Dr followed by the doctor’s name, or say agent.`);
+  const say = await hospitalPolish(
+    callSid,
+    `I can help with appointments at ${HOSPITAL_NAME}. Say a department like cardiology, or say Dr followed by the doctor’s name, or say agent.`
+  );
   pushTranscript(callSid, "assistant", say);
   return { say, transfer: false };
 }
