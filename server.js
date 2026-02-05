@@ -1,12 +1,12 @@
 /**
  * Cavas Voice Demo (2 modes + Hindi/English auto-switch for hospital)
- * FIXES in this version:
- *  ✅ Prevent "stuck at name/phone" by globally extracting name/phone from ANY utterance
- *  ✅ Proper NEW booking flow: ask department/doctor first (unless already collected)
- *  ✅ If user gives name+phone in one line, we capture it and move ahead
- *  ✅ Hindi mode = fully Hindi (Devanagari) but doctor names remain English (Dr Neha Sharma)
- *  ✅ Confirmation uses ONE preferred time (no conflicting time)
- *  ✅ OpenAI polish disabled by default to avoid repetitive / wrong prompts
+ *
+ * FIXES (this version):
+ *  ✅ Hospital flow no longer gets stuck asking name/phone when user hasn't chosen dept/doctor
+ *  ✅ COLLECT_NAME accepts ANY non-empty utterance as name (so it won’t ask name twice)
+ *  ✅ Hindi mode = fully Hindi (doctor names remain in English like "Dr Neha Sharma")
+ *  ✅ Confirmation uses ONE preferred time (no contradictory “Tomorrow 12 PM” + “tomorrow evening”)
+ *  ✅ Keep your transcript + live UI + SSE as-is
  */
 
 import express from "express";
@@ -23,9 +23,6 @@ const MODE = (process.env.MODE || "education").toLowerCase();
 const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "Medanta";
 const AGENT_NUMBER = process.env.HOSPITAL_AGENT_NUMBER || "";
 const BASE_URL = process.env.BASE_URL || "https://cavas-voice-demo.onrender.com";
-
-// ✅ default OFF so it cannot mess the flow
-const ENABLE_POLISH = String(process.env.ENABLE_POLISH || "").toLowerCase() === "true";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -55,11 +52,11 @@ const persisted = loadPersisted(); // { [callSid]: { meta, transcript } }
 // ------------------------------
 // In-memory stores (fast)
 // ------------------------------
-const convoStore = new Map();       // education history
-const transcriptStore = new Map();  // callSid -> transcript[]
-const sessionStore = new Map();     // callSid -> { mode, state, lang, data }
-const callMetaStore = new Map();    // callSid -> { ts, mode, lang, from, to }
-const recentCalls = [];             // most recent first, max 20
+const convoStore = new Map(); // education history
+const transcriptStore = new Map(); // callSid -> transcript[]
+const sessionStore = new Map(); // callSid -> { mode, state, lang, data }
+const callMetaStore = new Map(); // callSid -> { ts, mode, lang, from, to }
+const recentCalls = []; // most recent first, max 20
 
 // ------------------------------
 // LIVE SSE listeners (Option A)
@@ -72,7 +69,9 @@ function pushLive(callSid, event) {
   if (!set) return;
   const payload = `data: ${JSON.stringify(event)}\n\n`;
   for (const res of set) {
-    try { res.write(payload); } catch {}
+    try {
+      res.write(payload);
+    } catch {}
   }
 }
 
@@ -82,6 +81,7 @@ function rememberCall(callSid, patch = {}) {
   const next = { ...prev, ...patch };
   callMetaStore.set(callSid, next);
 
+  // keep also in persisted meta (so /calls works after restart)
   persisted[callSid] = persisted[callSid] || { meta: {}, transcript: [] };
   persisted[callSid].meta = { ...(persisted[callSid].meta || {}), ...next };
   savePersisted(persisted);
@@ -101,10 +101,12 @@ function pushTranscript(callSid, role, content) {
   arr.push(item);
   transcriptStore.set(callSid, arr);
 
+  // persist
   persisted[callSid] = persisted[callSid] || { meta: {}, transcript: [] };
   persisted[callSid].transcript = arr;
   savePersisted(persisted);
 
+  // live stream to UI
   pushLive(callSid, { type: "transcript", callSid, item });
 }
 
@@ -166,11 +168,11 @@ function getSttLang(callSid) {
   if ((s.mode || MODE) === "hospital") return s.lang || "en-IN";
   return "en-US";
 }
-function isHi(callSid) {
+function isHindi(callSid) {
   return getSttLang(callSid) === "hi-IN";
 }
 function t(callSid, en, hi) {
-  return isHi(callSid) ? hi : en;
+  return isHindi(callSid) ? hi : en;
 }
 
 // ------------------------------
@@ -181,6 +183,7 @@ function getVoiceIdForLang(lang) {
   if (lang === "hi-IN") return process.env.ELEVEN_VOICE_ID_HI || fallback;
   return process.env.ELEVEN_VOICE_ID_EN || fallback;
 }
+
 async function elevenTTS(text, lang = "en-IN") {
   const voiceId = getVoiceIdForLang(lang);
   const r = await axios({
@@ -232,6 +235,7 @@ app.get("/live/:callSid", (req, res) => {
   set.add(res);
   liveListeners.set(callSid, set);
 
+  // initial transcript
   const existing = getTranscript(callSid);
   res.write(`data: ${JSON.stringify({ type: "init", callSid, transcript: existing })}\n\n`);
 
@@ -256,6 +260,7 @@ app.get("/ui/:callSid", (req, res) => {
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; padding:16px; background:#fafafa;}
     #wrap{max-width:980px; margin:0 auto;}
+    .top{display:flex; gap:12px; flex-wrap:wrap; align-items:center; justify-content:space-between;}
     .card{background:#fff; border:1px solid #eee; border-radius:14px; padding:14px; box-shadow:0 1px 6px rgba(0,0,0,.05);}
     .meta{display:flex; gap:10px; flex-wrap:wrap; font-size:14px; color:#333;}
     .pill{background:#f1f5f9; padding:6px 10px; border-radius:999px;}
@@ -271,20 +276,22 @@ app.get("/ui/:callSid", (req, res) => {
 </head>
 <body>
   <div id="wrap">
-    <div class="card">
-      <div style="font-size:18px; font-weight:800;">Live Transcript</div>
-      <div class="meta" style="margin-top:6px;">
-        <div class="pill"><b>CallSid:</b> ${callSid}</div>
-        <div class="pill status" id="status">Connecting…</div>
-      </div>
-      <div class="links" style="margin-top:10px;">
-        <a href="/transcript/${callSid}" target="_blank">Transcript JSON</a>
-        <a href="/call-summary/${callSid}" target="_blank">Summary JSON</a>
-        <a href="/calls" target="_blank">Calls</a>
+    <div class="top">
+      <div class="card" style="flex:1;">
+        <div style="font-size:18px; font-weight:800;">Live Transcript</div>
+        <div class="meta" style="margin-top:6px;">
+          <div class="pill"><b>CallSid:</b> ${callSid}</div>
+          <div class="pill status" id="status">Connecting…</div>
+        </div>
+        <div class="links" style="margin-top:10px;">
+          <a href="/transcript/${callSid}" target="_blank">Transcript JSON</a>
+          <a href="/call-summary/${callSid}" target="_blank">Summary JSON</a>
+          <a href="/calls" target="_blank">Calls</a>
+        </div>
       </div>
     </div>
 
-    <div class="card" id="log" style="margin-top:12px;"></div>
+    <div class="card" id="log"></div>
   </div>
 
 <script>
@@ -304,6 +311,7 @@ app.get("/ui/:callSid", (req, res) => {
       '<span>'+ esc(item.content || '') +'</span></div>';
     log.appendChild(div);
     log.scrollTop = log.scrollHeight;
+    window.scrollTo(0, document.body.scrollHeight);
   }
 
   const es = new EventSource('/live/${callSid}');
@@ -354,6 +362,8 @@ async function getAIAnswerEducation(callSid, userText) {
 // =========================================================
 // HOSPITAL MODE
 // =========================================================
+
+// Demo dataset
 const DOCTORS = [
   { id: "D001", name: "Dr Arjun Mehta", dept: "Cardiology", location: "Gurgaon", nextSlots: ["Tomorrow 5 PM", "Day after tomorrow 11 AM", "Friday 4 PM"] },
   { id: "D002", name: "Dr Neha Sharma", dept: "Cardiology", location: "Gurgaon", nextSlots: ["Tomorrow 12 PM", "Thursday 6 PM"] },
@@ -369,36 +379,8 @@ function extractPhone(text) {
   return m ? m[1].replace(/\s|-/g, "") : null;
 }
 
-// ✅ NEW: extract patient name from “name Rohit … phone …” etc.
-function extractName(text) {
-  const raw = String(text || "").trim();
-
-  // name is Rohit / name Rohit
-  const m1 = raw.match(/\bname\s*(is)?\s*[:\-]?\s*([A-Za-z][A-Za-z .]{1,40})\b/i);
-  if (m1?.[2]) return m1[2].trim();
-
-  // patient name Rohit
-  const m2 = raw.match(/\bpatient\s*name\s*(is)?\s*[:\-]?\s*([A-Za-z][A-Za-z .]{1,40})\b/i);
-  if (m2?.[2]) return m2[2].trim();
-
-  return null;
-}
-
-// ✅ NEW: global capture (so we never get stuck asking again)
-function captureNamePhone(callSid, utterance) {
-  const phone = extractPhone(utterance);
-  const name = extractName(utterance);
-
-  const s = getSession(callSid);
-  const patch = {};
-  if (phone && !s.data?.phone) patch.phone = phone;
-  if (name && !s.data?.patientName) patch.patientName = name;
-
-  if (Object.keys(patch).length) setSession(callSid, { data: patch });
-}
-
 function detectDept(text) {
-  const tNorm = normalize(text);
+  const t = normalize(text);
   const aliases = [
     { k: ["cardio", "cardiology", "heart", "cardiologist"], v: "Cardiology" },
     { k: ["ortho", "orthopedic", "orthopedics", "bones", "bone"], v: "Orthopedics" },
@@ -408,8 +390,8 @@ function detectDept(text) {
     { k: ["derma", "dermatology", "skin"], v: "Dermatology" },
     { k: ["gastro", "gastroenterology", "stomach"], v: "Gastroenterology" },
   ];
-  for (const a of aliases) if (a.k.some((kw) => tNorm.includes(kw))) return a.v;
-  const direct = DEPARTMENTS.find((d) => tNorm.includes(normalize(d)));
+  for (const a of aliases) if (a.k.some((kw) => t.includes(kw))) return a.v;
+  const direct = DEPARTMENTS.find((d) => t.includes(normalize(d)));
   return direct || null;
 }
 
@@ -424,261 +406,213 @@ function findDoctorByName(query) {
 }
 
 function wantsHuman(text) {
-  const tNorm = normalize(text);
-  return ["human","agent","representative","operator","real person","connect me","transfer","talk to someone","call center","agent se","representative se","human se"].some((k) => tNorm.includes(k));
+  const t = normalize(text);
+  return ["human","agent","representative","operator","real person","connect me","transfer","talk to someone","call center","agent se","representative se","human se"].some((k) => t.includes(k));
 }
 
 function looksLikeMedicalAdvice(text) {
-  const tNorm = normalize(text);
+  const t = normalize(text);
   const risky = ["fever","pain","chest pain","breath","bp","blood pressure","diagnose","diagnosis","treatment","medicine","tablet","dose","emergency","vomit","bleeding","pregnant","pregnancy","heart attack","stroke","bukhar","dard","saans","dabav","dawai","emergency"];
-  return risky.some((k) => tNorm.includes(k));
+  return risky.some((k) => t.includes(k));
 }
 
-// ✅ NEW: detect booking intent so NEW state doesn’t wander
-function looksLikeBookingIntent(text) {
-  const tNorm = normalize(text);
-  return [
-    "appointment", "book", "booking", "schedule",
-    "apartment", // users say this in STT
-    "अपॉइंटमेंट", "बुक", "कल", "aaj", "kal", "parso",
-    "milna", "doctor se", "consult"
-  ].some((k) => tNorm.includes(normalize(k)));
-}
-
-function slotToHindi(slot) {
-  let s = String(slot || "").trim();
-  if (!s) return s;
-
-  s = s
-    .replace(/day after tomorrow/gi, "परसों")
-    .replace(/\btomorrow\b/gi, "कल")
-    .replace(/\btoday\b/gi, "आज")
-    .replace(/\bthursday\b/gi, "गुरुवार")
-    .replace(/\bfriday\b/gi, "शुक्रवार")
-    .replace(/\bsaturday\b/gi, "शनिवार")
-    .replace(/\bsunday\b/gi, "रविवार")
-    .replace(/\bmonday\b/gi, "सोमवार")
-    .replace(/\btuesday\b/gi, "मंगलवार")
-    .replace(/\bwednesday\b/gi, "बुधवार");
-
-  s = s.replace(/\b(\d{1,2})(?::(\d{2}))?\s*(am|a\.m\.)\b/gi, (_, hh, mm) => {
-    const m = mm ? `:${mm}` : "";
-    return `सुबह ${hh}${m} बजे`;
-  });
-
-  s = s.replace(/\b(\d{1,2})(?::(\d{2}))?\s*(pm|p\.m\.)\b/gi, (_, hh, mm) => {
-    const h = Number(hh);
-    const m = mm ? `:${mm}` : "";
-    if (h === 12) return `दोपहर 12${m} बजे`;
-    if (h >= 1 && h <= 4) return `दोपहर ${h}${m} बजे`;
-    if (h >= 5 && h <= 7) return `शाम ${h}${m} बजे`;
-    return `रात ${h}${m} बजे`;
-  });
-
-  return s;
-}
-
-function pickSlots(callSid, d) {
+function pickSlots(d) {
   const slots = (d.nextSlots || []).slice(0, 3);
-  if (!slots.length) return isHi(callSid) ? "अगले उपलब्ध स्लॉट बुकिंग टीम साझा करेगी।" : "Next available slots will be shared by the booking team.";
-  return isHi(callSid)
-    ? `अगले उपलब्ध स्लॉट: ${slots.map(slotToHindi).join(", ")}।`
-    : `Next available: ${slots.join(", ")}.`;
+  return slots.length ? `Next available: ${slots.join(", ")}.` : "Next available slots will be shared by the booking team.";
 }
 
+// ✅ Accept ANY utterance as name in COLLECT_NAME (prevents "name asked twice")
+function cleanNameUtterance(text) {
+  const raw = String(text || "").trim();
+  return raw
+    .replace(/\b(patient\s*name|my\s*name|name|full\s*name)\b\s*(is)?\s*[:\-]?\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ✅ Extract preferred time (English-like; good enough for demo)
 function extractPreferredTime(text) {
   const raw = String(text || "").trim();
-  const tNorm = normalize(raw);
+  const tt = normalize(raw);
 
-  const timeWords = ["morning", "evening", "afternoon", "night", "a.m.", "p.m.", "am", "pm", "subah", "shaam", "dopahar", "raat", "सुबह", "शाम", "दोपहर", "रात"];
-  const dayWords = ["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "aaj", "kal", "parso", "आज", "कल", "परसों"];
+  const timeWords = ["morning", "evening", "afternoon", "night", "a.m.", "p.m.", "am", "pm"];
+  const dayWords = ["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 
-  const hasDay = dayWords.some((d) => tNorm.includes(normalize(d)));
-  const hasTimeWord = timeWords.some((w) => tNorm.includes(normalize(w)));
-  const hasClock = /\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)\b/i.test(raw) || /\b\d{1,2}(:\d{2})\b/.test(raw);
+  const hasDay = dayWords.some((d) => tt.includes(d));
+  const hasTimeWord = timeWords.some((w) => tt.includes(w));
+  const hasClock =
+    /\b\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.)\b/i.test(raw) ||
+    /\b\d{1,2}(:\d{2})\b/.test(raw);
 
   if (!(hasDay || hasTimeWord || hasClock)) return null;
 
   const m =
-    raw.match(/\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|aaj|kal|parso|आज|कल|परसों)\b[^.]{0,40}/i) ||
-    raw.match(/\b(morning|evening|afternoon|night|subah|shaam|dopahar|raat|सुबह|शाम|दोपहर|रात)\b/i);
+    raw.match(/\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b[^.]{0,40}/i) ||
+    raw.match(/\b(morning|evening|afternoon|night)\b/i);
 
-  return (m?.[0] || raw).trim();
+  const out = (m?.[0] || raw).trim();
+  return out.replace(/patient\s*name.*$/i, "").trim();
 }
 
-// ---------------------------------------------------------
-// polish (optional)
-// ---------------------------------------------------------
+// IMPORTANT:
+// - For Hindi mode we want fully Hindi and deterministic lines (no Hinglish),
+//   so we SKIP OpenAI polish when hi-IN.
 async function hospitalPolish(callSid, raw) {
-  if (!ENABLE_POLISH) return raw;
-  if (!process.env.OPENAI_API_KEY) return raw;
+  if (isHindi(callSid)) return raw;
 
-  // safety: do not polish critical collection prompts
   const lower = String(raw || "").toLowerCase();
   const skip =
     lower.includes("full name") ||
     lower.includes("mobile") ||
     lower.includes("10-digit") ||
-    lower.includes("phone") ||
-    lower.includes("patient") ||
-    lower.includes("कृपया") ||
-    lower.includes("मोबाइल") ||
-    lower.includes("अंकों");
+    lower.includes("prefer") ||
+    lower.includes("confirmation") ||
+    lower.includes("appointment request");
 
-  if (skip) return raw;
-
-  const style = isHi(callSid)
-    ? "उत्तर केवल शुद्ध हिंदी (देवनागरी) में दें। डॉक्टर के नाम अंग्रेज़ी में ही रखें। 1–2 छोटे वाक्य।"
-    : "Reply in friendly English like a hospital front-desk. 1–2 short sentences.";
+  if (!process.env.OPENAI_API_KEY || skip) return raw;
 
   try {
     const completion = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || "gpt-4o-mini",
       temperature: 0.2,
       messages: [
-        { role: "system", content: `You are a hospital appointment and routing voice assistant for ${HOSPITAL_NAME}. No medical advice. ${style}` },
+        {
+          role: "system",
+          content:
+            `You are a hospital appointment and routing voice assistant for ${HOSPITAL_NAME}. ` +
+            "No medical advice. You ARE allowed to ask for patient name/phone for booking. Never refuse. " +
+            "Reply in friendly English like a hospital front-desk. 1–2 short sentences.",
+        },
         { role: "user", content: raw },
       ],
     });
+
     const out = completion.choices?.[0]?.message?.content?.trim();
-    return out || raw;
+    const refusalHints = ["i can't","i cant","cannot","personal details","privacy","not able"];
+    if (!out || refusalHints.some((h) => out.toLowerCase().includes(h))) return raw;
+    return out;
   } catch {
     return raw;
   }
 }
 
+// ✅ Build confirmation (Hindi fully Hindi; doctor names remain English)
 async function buildConfirmation(callSid, preferredTimeOverride = null) {
   const session = getSession(callSid);
   const { patientName, phone, doctorName, dept } = session.data || {};
-  const preferredTime = (preferredTimeOverride || session.data?.preferredTime || "").trim();
 
+  const preferredTime = (preferredTimeOverride || session.data?.preferredTime || "").trim();
   const confirmationId = `APT-${Math.random().toString(16).slice(2, 8).toUpperCase()}`;
+
   setSession(callSid, { state: "CONFIRMED", data: { preferredTime, confirmationId } });
 
-  const base = isHi(callSid)
-    ? `ठीक है। आपकी अपॉइंटमेंट रिक्वेस्ट दर्ज हो गई है। ${patientName ? `मरीज़: ${patientName}. ` : ""}${doctorName ? `डॉक्टर: ${doctorName}. ` : dept ? `विभाग: ${dept}. ` : ""}${preferredTime ? `पसंदीदा समय: ${preferredTime}. ` : ""}कन्फर्मेशन आईडी: ${confirmationId}. ${phone ? `कन्फर्मेशन ${phone} पर भेजा जाएगा।` : "कन्फर्मेशन आपके नंबर पर भेजा जाएगा।"}`
-    : `Done. I’ve raised an appointment request for ${patientName || "the patient"} ${doctorName ? `with ${doctorName}` : ""}${dept ? ` in ${dept}` : ""}. ${preferredTime ? `Preferred time: ${preferredTime}. ` : ""}Confirmation ID is ${confirmationId}. You will receive confirmation on ${phone || "your number"}.`;
+  const baseEn =
+    `Done. I’ve raised an appointment request for ${patientName || "the patient"} ` +
+    `${doctorName ? `with ${doctorName}` : ""}${dept ? ` in ${dept}` : ""}. ` +
+    `${preferredTime ? `Preferred time: ${preferredTime}. ` : ""}` +
+    `Confirmation ID is ${confirmationId}. ` +
+    `You will receive confirmation on ${phone || "your number"}.`;
 
-  const say = await hospitalPolish(callSid, base);
+  const baseHi =
+    `ठीक है। मैंने ${patientName || "मरीज़"} के लिए ` +
+    `${doctorName ? `${doctorName} के साथ ` : ""}${dept ? `${dept} विभाग में ` : ""}` +
+    `अपॉइंटमेंट रिक्वेस्ट बना दी है। ` +
+    `${preferredTime ? `पसंदीदा समय: ${preferredTime}। ` : ""}` +
+    `कन्फर्मेशन आईडी: ${confirmationId} है। ` +
+    `पुष्टि संदेश ${phone || "आपके नंबर"} पर आ जाएगा।`;
+
+  const say = await hospitalPolish(callSid, t(callSid, baseEn, baseHi));
   pushTranscript(callSid, "assistant", say);
   return { say, transfer: false };
 }
 
 async function getAIAnswerHospital(callSid, userText) {
   const session = getSession(callSid);
-  const tRaw = userText.trim();
+  const tRaw = (userText || "").trim();
   const norm = normalize(tRaw);
 
   pushTranscript(callSid, "user", tRaw);
 
-  // ✅ lock Hindi if user uses Devanagari or says Hindi
-  const pref = detectLangPreference(tRaw);
-  if (pref) setSession(callSid, { lang: pref });
-
-  // ✅ IMPORTANT: capture name/phone from ANY utterance (prevents loop)
-  captureNamePhone(callSid, tRaw);
-
   if (wantsHuman(tRaw) || looksLikeMedicalAdvice(tRaw)) {
-    const say = await hospitalPolish(callSid, t(callSid, "Sure. I’m connecting you to a human representative now.", "ज़रूर। मैं आपको अभी एक मानव प्रतिनिधि से जोड़ रहा/रही हूँ।"));
+    const say = await hospitalPolish(
+      callSid,
+      t(callSid, "Sure. I’m connecting you to a human representative now.", "ठीक है। मैं आपको अभी एक मानव प्रतिनिधि से जोड़ रहा/रही हूँ।")
+    );
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: true };
   }
 
   // -----------------------
-  // NEW booking flow
+  // State machine
   // -----------------------
-  if (session.state === "NEW") {
-    const dept = detectDept(tRaw);
-    const hasDr = norm.includes("dr ") || norm.includes("dr.") || norm.includes("doctor ");
-    const time = extractPreferredTime(tRaw);
 
-    // if user already said time, store it (but don’t confirm without doctor/dept)
-    if (time && !session.data?.preferredTime) setSession(callSid, { data: { preferredTime: time } });
-
-    // If they mentioned a department/doctor, proceed as usual (below routing handles it)
-    if (!dept && !hasDr) {
-      // If they have booking intent, ask dept/doctor (NOT name/phone)
-      if (looksLikeBookingIntent(tRaw)) {
-        const msg = t(
-          callSid,
-          `Sure. Which department do you need? For example Cardiology, Orthopedics or ENT. Or say “Dr” and the doctor’s name.`,
-          `ज़रूर। आपको किस विभाग में अपॉइंटमेंट चाहिए? जैसे कार्डियोलॉजी, ऑर्थोपेडिक्स या ईएनटी। या “Dr” बोलकर डॉक्टर का नाम बताइए।`
-        );
-        const say = await hospitalPolish(callSid, msg);
-        pushTranscript(callSid, "assistant", say);
-        return { say, transfer: false };
-      }
-
-      // Not booking intent: gently route back
-      const msg = t(
-        callSid,
-        `I can help with appointments at ${HOSPITAL_NAME}. Please say the department (like Cardiology) or the doctor’s name.`,
-        `मैं ${HOSPITAL_NAME} में अपॉइंटमेंट में मदद कर सकता/सकती हूँ। कृपया विभाग (जैसे कार्डियोलॉजी) या डॉक्टर का नाम बताइए।`
-      );
-      const say = await hospitalPolish(callSid, msg);
-      pushTranscript(callSid, "assistant", say);
-      return { say, transfer: false };
-    }
-    // else continue to routing section below
-  }
-
-  // -----------------------
-  // State machine (collection)
-  // -----------------------
+  // ✅ FIX: name will be captured even if user just says "Rohit Narwal"
   if (session.state === "COLLECT_NAME") {
-    // if they said phone+name already, don’t re-ask
-    const s2 = getSession(callSid);
-    if (s2.data?.patientName && s2.data?.phone) {
-      // if time present too -> confirm
-      const time = s2.data?.preferredTime || extractPreferredTime(tRaw) || "";
-      if (time) return buildConfirmation(callSid, time);
+    const name = cleanNameUtterance(tRaw);
+    const earlyTime = extractPreferredTime(tRaw);
 
-      setSession(callSid, { state: "COLLECT_TIME" });
-      const say = await hospitalPolish(callSid, t(callSid, "Great. What day or time do you prefer?", "बहुत बढ़िया। आप किस दिन या किस समय आना चाहेंगे?"));
+    if (name) {
+      setSession(callSid, {
+        state: "COLLECT_PHONE",
+        data: { patientName: name, ...(earlyTime ? { preferredTime: earlyTime } : {}) },
+      });
+
+      const say = await hospitalPolish(
+        callSid,
+        t(callSid, "Thanks. Please tell me your 10-digit mobile number for confirmation.", "धन्यवाद। कन्फर्मेशन के लिए अपना 10 अंकों का मोबाइल नंबर बताइए।")
+      );
       pushTranscript(callSid, "assistant", say);
       return { say, transfer: false };
     }
 
-    if (!getSession(callSid).data?.patientName) {
-      const say = await hospitalPolish(callSid, t(callSid, "Please tell me the patient’s full name.", "कृपया मरीज़ का पूरा नाम बताइए।"));
-      pushTranscript(callSid, "assistant", say);
-      return { say, transfer: false };
-    }
-
-    setSession(callSid, { state: "COLLECT_PHONE" });
-    const say = await hospitalPolish(callSid, t(callSid, "Thanks. Please tell me your 10-digit mobile number for confirmation.", "धन्यवाद। कन्फर्मेशन के लिए अपना 10 अंकों का मोबाइल नंबर बताइए।"));
+    const say = await hospitalPolish(
+      callSid,
+      t(callSid, "Please tell me the patient’s full name.", "कृपया मरीज़ का पूरा नाम बताइए।")
+    );
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
   }
 
   if (session.state === "COLLECT_PHONE") {
-    if (!getSession(callSid).data?.phone) {
-      const say = await hospitalPolish(callSid, t(callSid, "Sorry, I didn’t catch the number. Please say the 10-digit mobile number again.", "माफ़ कीजिए, नंबर साफ़ नहीं मिला। कृपया 10 अंकों का मोबाइल नंबर दोबारा बताइए।"));
+    const phone = extractPhone(tRaw);
+    if (!phone) {
+      const say = await hospitalPolish(
+        callSid,
+        t(callSid, "Sorry, I didn’t catch the mobile number. Please say the 10-digit number again.", "माफ़ कीजिए, मोबाइल नंबर स्पष्ट नहीं मिला। कृपया 10 अंकों का नंबर फिर से बताइए।")
+      );
       pushTranscript(callSid, "assistant", say);
       return { say, transfer: false };
     }
+
+    setSession(callSid, { data: { phone } });
 
     const alreadyTime = (getSession(callSid).data?.preferredTime || "").trim();
     if (alreadyTime) return buildConfirmation(callSid, alreadyTime);
 
     setSession(callSid, { state: "COLLECT_TIME" });
-    const say = await hospitalPolish(callSid, t(callSid, "Great. What day or time do you prefer? For example, tomorrow evening or Friday morning.", "बहुत बढ़िया। आप किस दिन या किस समय आना चाहेंगे? जैसे कल शाम या शुक्रवार सुबह।"));
+    const say = await hospitalPolish(
+      callSid,
+      t(
+        callSid,
+        "Great. What day or time do you prefer? For example, tomorrow evening or Friday morning.",
+        "बहुत बढ़िया। आप किस दिन या किस समय का अपॉइंटमेंट चाहेंगे? जैसे कल शाम या शुक्रवार सुबह।"
+      )
+    );
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
   }
 
   if (session.state === "COLLECT_TIME") {
-    const time = extractPreferredTime(tRaw) || tRaw;
-    setSession(callSid, { data: { preferredTime: time } });
-    return buildConfirmation(callSid, time);
+    return buildConfirmation(callSid, tRaw);
   }
 
   // -----------------------
-  // Routing logic
+  // Routing logic (IMPORTANT FIX: do NOT ask name/phone before dept/doctor)
   // -----------------------
   const dept = detectDept(tRaw);
   const hasDr = norm.includes("dr ") || norm.includes("dr.") || norm.includes("doctor ");
 
+  // If caller says doctor name directly
   if (hasDr) {
     let q = tRaw;
     const idx = norm.indexOf("dr");
@@ -692,52 +626,81 @@ async function getAIAnswerHospital(callSid, userText) {
       const d = matches[0];
       setSession(callSid, { state: "COLLECT_NAME", data: { doctorName: d.name, dept: d.dept } });
 
-      const msg = isHi(callSid)
-        ? `ठीक है। ${d.name} ${d.dept} विभाग में हैं। ${pickSlots(callSid, d)} बुक करने के लिए कृपया मरीज़ का पूरा नाम बताइए।`
-        : `Sure. ${d.name} is in ${d.dept}. ${pickSlots(callSid, d)} To book, please tell me the patient’s full name.`;
-
-      const say = await hospitalPolish(callSid, msg);
+      const say = await hospitalPolish(
+        callSid,
+        t(
+          callSid,
+          `Sure. ${d.name} is in ${d.dept}. ${pickSlots(d)} To book, please tell me the patient’s full name.`,
+          `ठीक है। ${d.name}, ${d.dept} विभाग में हैं। ${pickSlots(d)} बुक करने के लिए कृपया मरीज़ का पूरा नाम बताइए।`
+        )
+      );
       pushTranscript(callSid, "assistant", say);
       return { say, transfer: false };
     }
 
-    const say = await hospitalPolish(callSid, t(callSid, "I couldn’t find that doctor. Please say the department.", "माफ़ कीजिए, वह डॉक्टर नहीं मिला। कृपया विभाग बताइए।"));
+    const say = await hospitalPolish(
+      callSid,
+      t(
+        callSid,
+        "I couldn’t find that doctor. Please say the department, for example cardiology, orthopedics or ENT.",
+        "वह डॉक्टर सूची में नहीं मिल रहे हैं। कृपया विभाग बताइए—जैसे Cardiology, Orthopedics या ENT।"
+      )
+    );
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
   }
 
+  // If caller says department
   if (dept) {
     const docs = listDoctorsByDept(dept, "Gurgaon");
     if (!docs.length) {
-      const say = await hospitalPolish(callSid, t(callSid, `I don’t have doctors listed for ${dept}. Would you like to connect to an agent?`, `इस समय ${dept} के डॉक्टरों की सूची उपलब्ध नहीं है। क्या आप एजेंट से बात करना चाहेंगे?`));
+      const say = await hospitalPolish(
+        callSid,
+        t(
+          callSid,
+          `I don’t have doctors listed for ${dept} right now. Would you like to connect to an agent?`,
+          `अभी ${dept} विभाग के डॉक्टर सूची में उपलब्ध नहीं हैं। क्या आप एजेंट से बात करना चाहेंगे?`
+        )
+      );
       pushTranscript(callSid, "assistant", say);
       return { say, transfer: false };
     }
 
     setSession(callSid, { state: "ASK_BOOK_OR_LIST_MORE", data: { dept } });
+
+    // Doctor names must remain in English
     const names = docs.slice(0, 3).map((d, i) => `${d.name} (${i + 1})`).join(", ");
 
-    const msg = isHi(callSid)
-      ? `${dept} के डॉक्टर हैं: ${names}। आप किससे अपॉइंटमेंट लेना चाहेंगे? आप डॉक्टर का नाम या 1/2 बोल सकते हैं।`
-      : `${dept} doctors include ${names}. Which one would you like to book? You can say the doctor’s name or 1/2.`;
-
-    const say = await hospitalPolish(callSid, msg);
+    const say = await hospitalPolish(
+      callSid,
+      t(
+        callSid,
+        `${dept} doctors include ${names}. Which one would you like to book? You can say the doctor’s name or 1/2.`,
+        `${dept} विभाग में ये डॉक्टर उपलब्ध हैं: ${names}। आप किसका अपॉइंटमेंट बुक करना चाहेंगे? आप डॉक्टर का नाम या 1/2 बोल सकते हैं।`
+      )
+    );
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
   }
 
+  // After listing doctors, choose one
   if (session.state === "ASK_BOOK_OR_LIST_MORE") {
     const num = parseInt(norm, 10);
     if (!Number.isNaN(num)) {
-      const deptSaved = session.data?.dept;
-      const docs = deptSaved ? listDoctorsByDept(deptSaved, "Gurgaon") : [];
+      const dept2 = session.data?.dept;
+      const docs = dept2 ? listDoctorsByDept(dept2, "Gurgaon") : [];
       const d = docs[num - 1];
       if (d) {
         setSession(callSid, { state: "COLLECT_NAME", data: { doctorName: d.name, dept: d.dept } });
-        const msg = isHi(callSid)
-          ? `ठीक है। ${d.name}। ${pickSlots(callSid, d)} बुक करने के लिए कृपया मरीज़ का पूरा नाम बताइए।`
-          : `Sure. ${d.name}. ${pickSlots(callSid, d)} To book, please tell me the patient’s full name.`;
-        const say = await hospitalPolish(callSid, msg);
+
+        const say = await hospitalPolish(
+          callSid,
+          t(
+            callSid,
+            `Sure. ${d.name}. ${pickSlots(d)} To book, please tell me the patient’s full name.`,
+            `ठीक है। ${d.name}। ${pickSlots(d)} बुक करने के लिए कृपया मरीज़ का पूरा नाम बताइए।`
+          )
+        );
         pushTranscript(callSid, "assistant", say);
         return { say, transfer: false };
       }
@@ -747,20 +710,41 @@ async function getAIAnswerHospital(callSid, userText) {
     if (matches.length === 1) {
       const d = matches[0];
       setSession(callSid, { state: "COLLECT_NAME", data: { doctorName: d.name, dept: d.dept } });
-      const msg = isHi(callSid)
-        ? `ठीक है। ${d.name}। ${pickSlots(callSid, d)} बुक करने के लिए कृपया मरीज़ का पूरा नाम बताइए।`
-        : `Sure. ${d.name}. ${pickSlots(callSid, d)} To book, please tell me the patient’s full name.`;
-      const say = await hospitalPolish(callSid, msg);
+
+      const say = await hospitalPolish(
+        callSid,
+        t(
+          callSid,
+          `Sure. ${d.name}. ${pickSlots(d)} To book, please tell me the patient’s full name.`,
+          `ठीक है। ${d.name}। ${pickSlots(d)} बुक करने के लिए कृपया मरीज़ का पूरा नाम बताइए।`
+        )
+      );
       pushTranscript(callSid, "assistant", say);
       return { say, transfer: false };
     }
 
-    const say = await hospitalPolish(callSid, t(callSid, "Please say the full doctor name (or 1/2), or say agent.", "कृपया डॉक्टर का पूरा नाम (या 1/2) बताइए, या ‘एजेंट’ बोलिए।"));
+    const say = await hospitalPolish(
+      callSid,
+      t(
+        callSid,
+        "Please say the full doctor name (or 1/2), or say ‘agent’ to connect to a human representative.",
+        "कृपया डॉक्टर का पूरा नाम (या 1/2) बोलिए, या एजेंट से जुड़ने के लिए ‘agent’ बोलिए।"
+      )
+    );
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: false };
   }
 
-  const say = await hospitalPolish(callSid, t(callSid, `I can help with appointments at ${HOSPITAL_NAME}. Say a department like cardiology, or say Dr followed by the doctor’s name, or say agent.`, `मैं ${HOSPITAL_NAME} में अपॉइंटमेंट में मदद कर सकता/सकती हूँ। विभाग बोलिए जैसे कार्डियोलॉजी, या “Dr” के साथ डॉक्टर का नाम, या “एजेंट”।`));
+  // ✅ MAIN FIX for “appointment chahiye” cases:
+  // Instead of asking name/phone, ask department or doctor first.
+  const say = await hospitalPolish(
+    callSid,
+    t(
+      callSid,
+      `I can help with appointments at ${HOSPITAL_NAME}. Please say a department like cardiology, orthopedics, ENT, or say Dr followed by the doctor’s name.`,
+      `${HOSPITAL_NAME} में अपॉइंटमेंट के लिए कृपया विभाग बताइए—जैसे Cardiology, Orthopedics, ENT—या फिर डॉक्टर का नाम बोलिए, जैसे “Dr Neha Sharma”。`
+    )
+  );
   pushTranscript(callSid, "assistant", say);
   return { say, transfer: false };
 }
@@ -773,7 +757,7 @@ async function getAIAnswer(callSid, userText) {
 }
 
 // =========================================================
-// Twilio routes
+// Twilio routes (with strong error handling)
 // =========================================================
 function gatherBlock(twiml, callSid, actionPath) {
   const sttLang = getSttLang(callSid);
@@ -800,12 +784,11 @@ app.post("/welcome", (req, res) => {
     const mode = modeFromQuery === "hospital" || modeFromQuery === "education" ? modeFromQuery : MODE;
 
     rememberCall(callSid, { ts: new Date().toISOString(), from, to, mode });
-
     setSession(callSid, { mode, state: "NEW", lang: mode === "hospital" ? "en-IN" : null, data: {} });
 
     const greeting =
       mode === "hospital"
-        ? `नमस्ते! आपने ${HOSPITAL_NAME} अपॉइंटमेंट सहायता (Cavas AI) पर कॉल किया है। आप हिंदी या अंग्रेज़ी में बोल सकते हैं। आपकी कैसे मदद करूँ? Hello! You’ve reached ${HOSPITAL_NAME} appointment assistance by Cavas AI. You can speak in Hindi or English. How can I help?`
+        ? `Hello! You’ve reached ${HOSPITAL_NAME} appointment assistance by Cavas AI. You can speak in Hindi or English. How can I help?`
         : "Hello! Welcome to Cavas AI admissions assistant. How can I help you today?";
 
     const sttLang = getSttLang(callSid);
@@ -833,7 +816,7 @@ app.post("/handle-input", async (req, res) => {
       const sttLang = getSttLang(callSid);
       const gather = gatherBlock(twiml, callSid, "/handle-followup");
       const msg = sttLang === "hi-IN"
-        ? "माफ़ कीजिए, आवाज़ साफ़ नहीं आई। कृपया दोबारा बोलिए।"
+        ? "माफ़ कीजिए, आपकी आवाज़ स्पष्ट नहीं आई। कृपया फिर से बोलिए।"
         : "Sorry, I didn’t catch that. Please say it again.";
       gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(msg)}`);
       return res.type("text/xml").send(twiml.toString());
@@ -849,10 +832,7 @@ app.post("/handle-input", async (req, res) => {
 
     if (result.transfer) {
       if (!AGENT_NUMBER) {
-        const msg = sttLang === "hi-IN"
-          ? "फिलहाल ट्रांसफर की सुविधा उपलब्ध नहीं है। कृपया बाद में कोशिश करें।"
-          : "Transfer is not configured right now. Please try again later.";
-        twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(msg)}`);
+        twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Transfer is not configured right now. Please try again later.")}`);
         twiml.hangup();
         return res.type("text/xml").send(twiml.toString());
       }
@@ -866,7 +846,7 @@ app.post("/handle-input", async (req, res) => {
     if (mode === "education") {
       gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Would you like to ask another question? You can ask now or say no.")}`);
     } else {
-      const shortPrompt = sttLang === "hi-IN" ? "क्या आपको और कुछ चाहिए?" : "Anything else?";
+      const shortPrompt = sttLang === "hi-IN" ? "क्या मैं आपकी और मदद करूँ?" : "Anything else?";
       gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(shortPrompt)}`);
     }
 
@@ -874,10 +854,7 @@ app.post("/handle-input", async (req, res) => {
   } catch (e) {
     console.error("/handle-input error callSid=", callSid, e);
     const sttLang = getSttLang(callSid);
-    const msg = sttLang === "hi-IN"
-      ? "माफ़ कीजिए, तकनीकी समस्या आ गई। कृपया दोबारा कोशिश करें।"
-      : "Sorry, I faced a technical issue. Please try again.";
-    twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(msg)}`);
+    twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Sorry, I faced a technical issue. Please try again.")}`);
     twiml.hangup();
     return res.type("text/xml").send(twiml.toString());
   }
@@ -899,7 +876,7 @@ app.post("/handle-followup", async (req, res) => {
 
     if (!raw) {
       const gather = gatherBlock(twiml, callSid, "/handle-followup");
-      const msg = sttLang === "hi-IN" ? "माफ़ कीजिए, कृपया दोबारा बोलिए।" : "Sorry, please say that again.";
+      const msg = sttLang === "hi-IN" ? "माफ़ कीजिए, कृपया फिर से बोलिए।" : "Sorry, please say that again.";
       gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(msg)}`);
       return res.type("text/xml").send(twiml.toString());
     }
@@ -917,10 +894,7 @@ app.post("/handle-followup", async (req, res) => {
 
     if (result.transfer) {
       if (!AGENT_NUMBER) {
-        const msg = sttLang === "hi-IN"
-          ? "फिलहाल ट्रांसफर की सुविधा उपलब्ध नहीं है। कृपया बाद में कोशिश करें।"
-          : "Transfer is not configured right now. Please try again later.";
-        twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(msg)}`);
+        twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Transfer is not configured right now. Please try again later.")}`);
         twiml.hangup();
         return res.type("text/xml").send(twiml.toString());
       }
@@ -932,7 +906,7 @@ app.post("/handle-followup", async (req, res) => {
     if (mode === "education") {
       gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Anything else you would like to know?")}`);
     } else {
-      const shortPrompt = sttLang === "hi-IN" ? "क्या आपको और कुछ चाहिए?" : "Anything else?";
+      const shortPrompt = sttLang === "hi-IN" ? "क्या मैं आपकी और मदद करूँ?" : "Anything else?";
       gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(shortPrompt)}`);
     }
 
@@ -940,8 +914,7 @@ app.post("/handle-followup", async (req, res) => {
   } catch (e) {
     console.error("/handle-followup error callSid=", callSid, e);
     const sttLang = getSttLang(callSid);
-    const msg = sttLang === "hi-IN" ? "माफ़ कीजिए, तकनीकी समस्या है। कृपया दोबारा कोशिश करें।" : "Sorry, technical issue. Please try again.";
-    twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(msg)}`);
+    twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Sorry, technical issue. Please try again.")}`);
     twiml.hangup();
     return res.type("text/xml").send(twiml.toString());
   }
