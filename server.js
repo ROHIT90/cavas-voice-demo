@@ -1,19 +1,9 @@
 /**
  * Cavas Voice Demo (2 modes + Hindi/English auto-switch for hospital + better loop handling)
- * MODE=education  -> admissions assistant (LLM) with explicit "ask another question" prompts
- * MODE=hospital   -> appointment + department + human handoff (safe, tool/data driven) + auto Hindi/English
- *
- * Env needed:
- *  - BASE_URL=https://cavas-voice-demo.onrender.com
- *  - MODE=hospital | education
- *  - OPENAI_API_KEY=...
- *  - OPENAI_MODEL=gpt-4o-mini (optional)
- *  - ELEVEN_API_KEY=...
- *  - ELEVEN_VOICE_ID=... (fallback voice)
- *  - ELEVEN_VOICE_ID_EN=... (optional)
- *  - ELEVEN_VOICE_ID_HI=... (optional)
- *  - HOSPITAL_AGENT_NUMBER=+91XXXXXXXXXX
- *  - HOSPITAL_NAME=Medanta (optional)
+ * + Transcript endpoints:
+ *   - GET /calls                -> list recent calls (CallSid, mode, lang, time)
+ *   - GET /transcript/:callSid  -> transcript only
+ *   - GET /call-summary/:callSid-> summary + transcript
  */
 
 import express from "express";
@@ -27,7 +17,6 @@ app.use(express.urlencoded({ extended: false }));
 const MODE = (process.env.MODE || "education").toLowerCase(); // "education" | "hospital"
 const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "Medanta";
 const AGENT_NUMBER = process.env.HOSPITAL_AGENT_NUMBER || ""; // e.g. +919999999999
-
 const BASE_URL = process.env.BASE_URL || "https://cavas-voice-demo.onrender.com";
 
 // ---------- OpenAI ----------
@@ -37,6 +26,21 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const convoStore = new Map();      // CallSid -> last 10 messages (education only)
 const transcriptStore = new Map(); // CallSid -> full transcript
 const sessionStore = new Map();    // CallSid -> { mode, state, lang, data }
+const callMetaStore = new Map();   // CallSid -> { ts, mode, lang, from, to }
+const recentCalls = [];            // array of CallSid (most recent first), max 20
+
+function rememberCall(callSid, patch = {}) {
+  if (!callSid) return;
+  const prev = callMetaStore.get(callSid) || { ts: new Date().toISOString() };
+  const next = { ...prev, ...patch };
+  callMetaStore.set(callSid, next);
+
+  // maintain recent list
+  const idx = recentCalls.indexOf(callSid);
+  if (idx >= 0) recentCalls.splice(idx, 1);
+  recentCalls.unshift(callSid);
+  while (recentCalls.length > 20) recentCalls.pop();
+}
 
 function getHistory(callSid) {
   return convoStore.get(callSid) || [];
@@ -45,7 +49,7 @@ function pushHistory(callSid, role, content) {
   if (!callSid) return;
   const arr = convoStore.get(callSid) || [];
   arr.push({ role, content });
-  while (arr.length > 10) arr.shift(); // last 5 exchanges
+  while (arr.length > 10) arr.shift();
   convoStore.set(callSid, arr);
 }
 function pushTranscript(callSid, role, content) {
@@ -73,11 +77,15 @@ function setSession(callSid, patch) {
     data: { ...(s.data || {}), ...(patch.data || {}) },
   };
   sessionStore.set(callSid, next);
+
+  // keep meta updated too
+  rememberCall(callSid, { mode: next.mode, lang: next.lang });
+
   return next;
 }
 
 // =========================================================
-// Language helpers (Hindi/English auto-switch for hospital)
+// Language helpers
 // =========================================================
 function normalize(s) {
   return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -94,12 +102,12 @@ function detectLangPreference(text) {
 }
 function getSttLang(callSid) {
   const s = getSession(callSid);
-  if ((s.mode || MODE) === "hospital") return s.lang || "en-IN"; // good for India + Hinglish
+  if ((s.mode || MODE) === "hospital") return s.lang || "en-IN";
   return "en-US";
 }
 
 // =========================================================
-// ElevenLabs TTS (language-aware, optional separate voices)
+// ElevenLabs TTS (language-aware)
 // =========================================================
 function getVoiceIdForLang(lang) {
   const fallback = process.env.ELEVEN_VOICE_ID;
@@ -144,7 +152,7 @@ app.get("/tts", async (req, res) => {
 app.get("/", (_, res) => res.send(`Cavas Voice Demo is running ✅ (MODE=${MODE})`));
 
 // =========================================================
-// 1) EDUCATION MODE (LLM)
+// Education mode
 // =========================================================
 async function getAIAnswerEducation(callSid, userText) {
   const history = getHistory(callSid);
@@ -177,54 +185,16 @@ async function getAIAnswerEducation(callSid, userText) {
 }
 
 // =========================================================
-// 2) HOSPITAL MODE (safe scheduling + routing)
+// Hospital mode dataset + helpers
 // =========================================================
-
-// ---- Demo dataset (replace with HIS/CRM API later) ----
 const DOCTORS = [
-  {
-    id: "D001",
-    name: "Dr Arjun Mehta",
-    dept: "Cardiology",
-    location: "Gurgaon",
-    languages: ["English", "Hindi"],
-    nextSlots: ["Tomorrow 5 PM", "Day after tomorrow 11 AM", "Friday 4 PM"],
-  },
-  {
-    id: "D002",
-    name: "Dr Neha Sharma",
-    dept: "Cardiology",
-    location: "Gurgaon",
-    languages: ["English", "Hindi"],
-    nextSlots: ["Tomorrow 12 PM", "Thursday 6 PM"],
-  },
-  {
-    id: "D003",
-    name: "Dr Rohan Kapoor",
-    dept: "Orthopedics",
-    location: "Gurgaon",
-    languages: ["English", "Hindi"],
-    nextSlots: ["Tomorrow 3 PM", "Saturday 10 AM"],
-  },
-  {
-    id: "D004",
-    name: "Dr Simran Kaur",
-    dept: "ENT",
-    location: "Gurgaon",
-    languages: ["English", "Hindi", "Punjabi"],
-    nextSlots: ["Tomorrow 1 PM", "Friday 2 PM"],
-  },
+  { id: "D001", name: "Dr Arjun Mehta", dept: "Cardiology", location: "Gurgaon", languages: ["English", "Hindi"], nextSlots: ["Tomorrow 5 PM", "Day after tomorrow 11 AM", "Friday 4 PM"] },
+  { id: "D002", name: "Dr Neha Sharma", dept: "Cardiology", location: "Gurgaon", languages: ["English", "Hindi"], nextSlots: ["Tomorrow 12 PM", "Thursday 6 PM"] },
+  { id: "D003", name: "Dr Rohan Kapoor", dept: "Orthopedics", location: "Gurgaon", languages: ["English", "Hindi"], nextSlots: ["Tomorrow 3 PM", "Saturday 10 AM"] },
+  { id: "D004", name: "Dr Simran Kaur", dept: "ENT", location: "Gurgaon", languages: ["English", "Hindi", "Punjabi"], nextSlots: ["Tomorrow 1 PM", "Friday 2 PM"] },
 ];
 
-const DEPARTMENTS = [
-  "Cardiology",
-  "Orthopedics",
-  "ENT",
-  "Neurology",
-  "Oncology",
-  "Dermatology",
-  "Gastroenterology",
-];
+const DEPARTMENTS = ["Cardiology", "Orthopedics", "ENT", "Neurology", "Oncology", "Dermatology", "Gastroenterology"];
 
 function extractPhone(text) {
   const t = String(text || "");
@@ -240,10 +210,7 @@ function findDoctorByName(query) {
 
 function listDoctorsByDept(dept, location = "Gurgaon") {
   const d = normalize(dept);
-  return DOCTORS.filter(
-    (x) =>
-      normalize(x.dept) === d && normalize(x.location) === normalize(location)
-  );
+  return DOCTORS.filter((x) => normalize(x.dept) === d && normalize(x.location) === normalize(location));
 }
 
 function detectDept(text) {
@@ -257,53 +224,32 @@ function detectDept(text) {
     { k: ["derma", "dermatology", "skin"], v: "Dermatology" },
     { k: ["gastro", "gastroenterology", "stomach"], v: "Gastroenterology" },
   ];
-  for (const a of aliases) {
-    if (a.k.some((kw) => t.includes(kw))) return a.v;
-  }
+  for (const a of aliases) if (a.k.some((kw) => t.includes(kw))) return a.v;
   const direct = DEPARTMENTS.find((d) => t.includes(normalize(d)));
   return direct || null;
 }
 
 function wantsHuman(text) {
   const t = normalize(text);
-  return [
-    "human",
-    "agent",
-    "representative",
-    "operator",
-    "real person",
-    "connect me",
-    "transfer",
-    "talk to someone",
-    "call center",
-    "agent se",
-    "representative se",
-    "human se",
-  ].some((k) => t.includes(k));
+  return ["human", "agent", "representative", "operator", "real person", "connect me", "transfer", "talk to someone", "call center", "agent se", "representative se", "human se"].some((k) => t.includes(k));
 }
 
 function looksLikeMedicalAdvice(text) {
   const t = normalize(text);
   const risky = [
-    "fever", "pain", "chest pain", "breath", "bp", "blood pressure",
-    "diagnose", "diagnosis", "treatment", "medicine", "tablet", "dose",
-    "emergency", "vomit", "bleeding", "pregnant", "pregnancy",
-    "heart attack", "stroke",
-    // common Hindi/Hinglish cues:
-    "bukhar", "dard", "saans", "dabav", "blood", "dawai", "emergency"
+    "fever","pain","chest pain","breath","bp","blood pressure","diagnose","diagnosis","treatment","medicine","tablet","dose",
+    "emergency","vomit","bleeding","pregnant","pregnancy","heart attack","stroke",
+    "bukhar","dard","saans","dabav","blood","dawai","emergency"
   ];
   return risky.some((k) => t.includes(k));
 }
 
 function summarizeTopDoctors(doctors) {
-  const top = doctors.slice(0, 3);
-  return top.map((d, i) => `${i + 1}. ${d.name} (${d.dept})`).join(". ");
+  return doctors.slice(0, 3).map((d, i) => `${i + 1}. ${d.name} (${d.dept})`).join(". ");
 }
-
 function pickSlots(d) {
   const slots = (d.nextSlots || []).slice(0, 3);
-  if (!slots.length) return "I can request the next available slot from the booking team.";
-  return `Next available: ${slots.join(", ")}.`;
+  return slots.length ? `Next available: ${slots.join(", ")}.` : "I can request the next available slot from the booking team.";
 }
 
 async function hospitalLLMPolish(callSid, rawReply) {
@@ -319,13 +265,7 @@ async function hospitalLLMPolish(callSid, rawReply) {
     model: process.env.OPENAI_MODEL || "gpt-4o-mini",
     temperature: 0.2,
     messages: [
-      {
-        role: "system",
-        content:
-          `You are a hospital appointment and routing voice assistant for ${HOSPITAL_NAME}. ` +
-          "You MUST NOT provide medical advice. Only appointments, departments, doctor options, and transferring to a human agent. " +
-          style,
-      },
+      { role: "system", content: `You are a hospital appointment and routing voice assistant for ${HOSPITAL_NAME}. You MUST NOT provide medical advice. Only appointments, departments, doctor options, and transferring to a human agent. ${style}` },
       { role: "user", content: rawReply },
     ],
   });
@@ -340,18 +280,12 @@ async function getAIAnswerHospital(callSid, userText) {
 
   pushTranscript(callSid, "user", t);
 
-  // immediate handoff (human request OR medical)
   if (wantsHuman(t) || looksLikeMedicalAdvice(t)) {
-    const reason = wantsHuman(t) ? "User requested human agent" : "Medical advice detected";
-    const say = await hospitalLLMPolish(
-      callSid,
-      `Sure. I’m connecting you to a human representative now. (${reason})`
-    );
+    const say = await hospitalLLMPolish(callSid, "Sure. I’m connecting you to a human representative now.");
     pushTranscript(callSid, "assistant", say);
     return { say, transfer: true, end: true };
   }
 
-  // state machine
   if (session.state === "COLLECT_NAME") {
     setSession(callSid, { state: "COLLECT_PHONE", data: { patientName: t } });
     const say = await hospitalLLMPolish(callSid, "Thanks. Please tell me your 10-digit mobile number for confirmation.");
@@ -375,14 +309,12 @@ async function getAIAnswerHospital(callSid, userText) {
   if (session.state === "COLLECT_TIME") {
     const confirmationId = `APT-${Math.random().toString(16).slice(2, 8).toUpperCase()}`;
     const { patientName, phone, doctorName, dept } = session.data || {};
-    const preferredTime = t;
-
-    setSession(callSid, { state: "CONFIRMED", data: { preferredTime, confirmationId } });
+    setSession(callSid, { state: "CONFIRMED", data: { preferredTime: t, confirmationId } });
 
     const baseConfirm =
       `Done. I’ve raised an appointment request for ${patientName || "the patient"} ` +
       `${doctorName ? `with ${doctorName}` : dept ? `in ${dept}` : ""}. ` +
-      `Preferred time: ${preferredTime}. Confirmation ID is ${confirmationId}. ` +
+      `Preferred time: ${t}. Confirmation ID is ${confirmationId}. ` +
       `You will receive confirmation on ${phone || "your number"}.`;
 
     const say = await hospitalLLMPolish(callSid, baseConfirm);
@@ -390,7 +322,6 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  // doctor name flow
   const dept = detectDept(t);
   const hasDr = norm.includes("dr ") || norm.includes("dr.") || norm.includes("doctor ");
 
@@ -405,34 +336,21 @@ async function getAIAnswerHospital(callSid, userText) {
 
     if (matches.length === 1) {
       const d = matches[0];
-      setSession(callSid, {
-        state: "COLLECT_NAME",
-        data: { doctorId: d.id, doctorName: d.name, dept: d.dept, location: d.location },
-      });
-
-      const base =
-        `Sure. ${d.name} is in ${d.dept} at ${d.location}. ${pickSlots(d)} ` +
-        "To book, please tell me the patient’s full name.";
-      const say = await hospitalLLMPolish(callSid, base);
+      setSession(callSid, { state: "COLLECT_NAME", data: { doctorId: d.id, doctorName: d.name, dept: d.dept, location: d.location } });
+      const say = await hospitalLLMPolish(callSid, `Sure. ${d.name} is in ${d.dept} at ${d.location}. ${pickSlots(d)} To book, please tell me the patient’s full name.`);
       pushTranscript(callSid, "assistant", say);
       return { say, end: false };
     }
 
     if (matches.length > 1) {
       setSession(callSid, { state: "ASK_DOCTOR_CHOICE", data: { doctorCandidates: matches.map((x) => x.id) } });
-      const base =
-        `I found multiple matches. ${summarizeTopDoctors(matches)}. ` +
-        "Please say the full doctor name you want to book with.";
-      const say = await hospitalLLMPolish(callSid, base);
+      const say = await hospitalLLMPolish(callSid, `I found multiple matches. ${summarizeTopDoctors(matches)}. Please say the full doctor name you want to book with.`);
       pushTranscript(callSid, "assistant", say);
       return { say, end: false };
     }
 
     setSession(callSid, { state: "ASK_DEPARTMENT", data: {} });
-    const say = await hospitalLLMPolish(
-      callSid,
-      "I couldn’t find that doctor name. Which department do you need—like cardiology, orthopedics, or ENT?"
-    );
+    const say = await hospitalLLMPolish(callSid, "I couldn’t find that doctor name. Which department do you need—like cardiology, orthopedics, or ENT?");
     pushTranscript(callSid, "assistant", say);
     return { say, end: false };
   }
@@ -441,14 +359,8 @@ async function getAIAnswerHospital(callSid, userText) {
     const matches = findDoctorByName(t);
     if (matches.length === 1) {
       const d = matches[0];
-      setSession(callSid, {
-        state: "COLLECT_NAME",
-        data: { doctorId: d.id, doctorName: d.name, dept: d.dept, location: d.location },
-      });
-      const base =
-        `Great. ${d.name} in ${d.dept}. ${pickSlots(d)} ` +
-        "To book, please tell me the patient’s full name.";
-      const say = await hospitalLLMPolish(callSid, base);
+      setSession(callSid, { state: "COLLECT_NAME", data: { doctorId: d.id, doctorName: d.name, dept: d.dept, location: d.location } });
+      const say = await hospitalLLMPolish(callSid, `Great. ${d.name} in ${d.dept}. ${pickSlots(d)} To book, please tell me the patient’s full name.`);
       pushTranscript(callSid, "assistant", say);
       return { say, end: false };
     }
@@ -457,7 +369,6 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  // department flow
   if (dept) {
     const docs = listDoctorsByDept(dept, "Gurgaon");
     if (!docs.length) {
@@ -465,14 +376,8 @@ async function getAIAnswerHospital(callSid, userText) {
       pushTranscript(callSid, "assistant", say);
       return { say, end: false };
     }
-
     setSession(callSid, { state: "ASK_BOOK_OR_LIST_MORE", data: { dept } });
-
-    const top = docs.slice(0, 3);
-    const base =
-      `${dept} has these doctors: ${top.map((d) => d.name).join(", ")}. ` +
-      "Would you like to book with one of them? If yes, say the doctor’s name.";
-    const say = await hospitalLLMPolish(callSid, base);
+    const say = await hospitalLLMPolish(callSid, `${dept} has these doctors: ${docs.slice(0, 3).map((d) => d.name).join(", ")}. Would you like to book with one of them? If yes, say the doctor’s name.`);
     pushTranscript(callSid, "assistant", say);
     return { say, end: false };
   }
@@ -484,13 +389,9 @@ async function getAIAnswerHospital(callSid, userText) {
       pushTranscript(callSid, "assistant", say);
       return { say, end: false };
     }
-    listDoctorsByDept(dpt, "Gurgaon"); // just to validate
+    const docs = listDoctorsByDept(dpt, "Gurgaon");
     setSession(callSid, { state: "ASK_BOOK_OR_LIST_MORE", data: { dept: dpt } });
-
-    const base =
-      `${dpt} doctors include ${listDoctorsByDept(dpt, "Gurgaon").slice(0, 3).map((d) => d.name).join(", ")}. ` +
-      "Say the doctor’s name to book, or say ‘agent’ to connect to a representative.";
-    const say = await hospitalLLMPolish(callSid, base);
+    const say = await hospitalLLMPolish(callSid, `${dpt} doctors include ${docs.slice(0, 3).map((d) => d.name).join(", ")}. Say the doctor’s name to book, or say ‘agent’ to connect.`);
     pushTranscript(callSid, "assistant", say);
     return { say, end: false };
   }
@@ -499,14 +400,8 @@ async function getAIAnswerHospital(callSid, userText) {
     const matches = findDoctorByName(t);
     if (matches.length === 1) {
       const d = matches[0];
-      setSession(callSid, {
-        state: "COLLECT_NAME",
-        data: { doctorId: d.id, doctorName: d.name, dept: d.dept, location: d.location },
-      });
-      const base =
-        `Sure. ${d.name}. ${pickSlots(d)} ` +
-        "To book, please tell me the patient’s full name.";
-      const say = await hospitalLLMPolish(callSid, base);
+      setSession(callSid, { state: "COLLECT_NAME", data: { doctorId: d.id, doctorName: d.name, dept: d.dept, location: d.location } });
+      const say = await hospitalLLMPolish(callSid, `Sure. ${d.name}. ${pickSlots(d)} To book, please tell me the patient’s full name.`);
       pushTranscript(callSid, "assistant", say);
       return { say, end: false };
     }
@@ -515,10 +410,10 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  const fallback =
-    `I can help with appointments and departments at ${HOSPITAL_NAME}. ` +
-    "Say a department like cardiology, say ‘Dr’ followed by the doctor’s name, or say ‘agent’ to connect to a human.";
-  const say = await hospitalLLMPolish(callSid, fallback);
+  const say = await hospitalLLMPolish(
+    callSid,
+    `I can help with appointments and departments at ${HOSPITAL_NAME}. Say a department like cardiology, say ‘Dr’ followed by the doctor’s name, or say ‘agent’ to connect to a human.`
+  );
   pushTranscript(callSid, "assistant", say);
   return { say, end: false };
 }
@@ -531,7 +426,7 @@ async function getAIAnswer(callSid, userText) {
 }
 
 // =========================================================
-// Twilio Routes (fixed: hospital no longer forces generic loop prompts)
+// Twilio Routes (hospital doesn't force generic loop prompts)
 // =========================================================
 
 // ---------- Welcome ----------
@@ -539,6 +434,8 @@ app.post("/welcome", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
 
   const callSid = req.body.CallSid;
+  const from = req.body.From || null;
+  const to = req.body.To || null;
 
   const modeFromQuery = (req.query.mode || "").toString().toLowerCase();
   const mode =
@@ -546,7 +443,9 @@ app.post("/welcome", (req, res) => {
       ? modeFromQuery
       : MODE;
 
-  // set per-call defaults
+  // remember call meta
+  rememberCall(callSid, { ts: new Date().toISOString(), from, to, mode });
+
   setSession(callSid, {
     mode,
     state: "NEW",
@@ -586,27 +485,18 @@ app.post("/handle-input", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // auto-switch lang for hospital based on user speech
   const pref = detectLangPreference(speech);
   if (pref) setSession(callSid, { lang: pref });
 
-  // Run brain
   const result = await getAIAnswer(callSid, speech);
 
-  // Use latest language (in case we switched)
   const sttLang = getSttLang(callSid);
 
-  // Speak answer
   twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(result.say)}`);
 
-  // Transfer if needed
   if (result.transfer) {
     if (!AGENT_NUMBER) {
-      twiml.play(
-        `${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(
-          "I cannot transfer right now because the agent number is not configured. Please try again later."
-        )}`
-      );
+      twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("I cannot transfer right now because the agent number is not configured. Please try again later.")}`);
       twiml.hangup();
       return res.type("text/xml").send(twiml.toString());
     }
@@ -626,16 +516,9 @@ app.post("/handle-input", async (req, res) => {
   });
 
   if (mode === "education") {
-    gather.play(
-      `${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(
-        "Would you like to ask another question? You can ask now or say no."
-      )}`
-    );
+    gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Would you like to ask another question? You can ask now or say no.")}`);
   } else {
-    const shortPrompt =
-      sttLang === "hi-IN"
-        ? "Aur kuch help chahiye? Aap bol sakte hain."
-        : "Anything else? You can speak now.";
+    const shortPrompt = sttLang === "hi-IN" ? "Aur kuch help chahiye? Aap bol sakte hain." : "Anything else? You can speak now.";
     gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(shortPrompt)}`);
   }
 
@@ -649,15 +532,13 @@ app.post("/handle-followup", async (req, res) => {
   const raw = (req.body.SpeechResult || "").trim();
   const speechLower = raw.toLowerCase();
 
-  // auto-switch lang for hospital
   const pref = detectLangPreference(raw);
   if (pref) setSession(callSid, { lang: pref });
 
   const sttLang = getSttLang(callSid);
   const mode = (getSession(callSid)?.mode || MODE);
 
-  // End words
-  const endWords = ["no", "bye", "thanks", "thank you", "that is all", "nahi", "nahin", "बस", "theek hai"];
+  const endWords = ["no", "bye", "thanks", "thank you", "that is all", "nahi", "nahin", "bas", "theek hai", "ok bye"];
   if (!speechLower || endWords.some((w) => speechLower.includes(w))) {
     const bye = sttLang === "hi-IN" ? "Dhanyavaad. Alvida." : "Thank you for calling. Goodbye.";
     twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(bye)}`);
@@ -667,17 +548,11 @@ app.post("/handle-followup", async (req, res) => {
 
   const result = await getAIAnswer(callSid, raw);
 
-  // Speak answer
   twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(result.say)}`);
 
-  // Transfer if needed
   if (result.transfer) {
     if (!AGENT_NUMBER) {
-      twiml.play(
-        `${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(
-          "I cannot transfer right now because the agent number is not configured. Please try again later."
-        )}`
-      );
+      twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("I cannot transfer right now because the agent number is not configured. Please try again later.")}`);
       twiml.hangup();
       return res.type("text/xml").send(twiml.toString());
     }
@@ -685,7 +560,6 @@ app.post("/handle-followup", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // Continue gather
   const gather = twiml.gather({
     input: "speech",
     bargeIn: true,
@@ -698,21 +572,42 @@ app.post("/handle-followup", async (req, res) => {
   if (mode === "education") {
     gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Anything else you would like to know?")}`);
   } else {
-    const shortPrompt =
-      sttLang === "hi-IN"
-        ? "Aur kya jaankari chahiye? Aap bol sakte hain."
-        : "Anything else? You can speak now.";
+    const shortPrompt = sttLang === "hi-IN" ? "Aur kya jaankari chahiye? Aap bol sakte hain." : "Anything else? You can speak now.";
     gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(shortPrompt)}`);
   }
 
   return res.type("text/xml").send(twiml.toString());
 });
 
-// ---------- Call Summary ----------
+// =========================================================
+// Transcript endpoints
+// =========================================================
+
+// List recent calls (so you can quickly get CallSid)
+app.get("/calls", (req, res) => {
+  const out = recentCalls.map((sid) => ({
+    callSid: sid,
+    ...(callMetaStore.get(sid) || {}),
+  }));
+  res.json({ count: out.length, calls: out });
+});
+
+// Transcript only
+app.get("/transcript/:callSid", (req, res) => {
+  const { callSid } = req.params;
+  const transcript = getTranscript(callSid);
+  if (!transcript.length) return res.status(404).json({ error: "No transcript found" });
+  res.json({
+    callSid,
+    ...(callMetaStore.get(callSid) || {}),
+    transcript,
+  });
+});
+
+// Summary + transcript
 app.get("/call-summary/:callSid", async (req, res) => {
   const { callSid } = req.params;
   const transcript = getTranscript(callSid);
-
   if (!transcript.length) return res.status(404).json({ error: "No transcript found" });
 
   const text = transcript.map((x) => `${x.role.toUpperCase()}: ${x.content}`).join("\n");
@@ -732,6 +627,7 @@ app.get("/call-summary/:callSid", async (req, res) => {
 
   res.json({
     callSid,
+    ...(callMetaStore.get(callSid) || {}),
     mode: (getSession(callSid)?.mode || MODE),
     lang: (getSession(callSid)?.lang || null),
     summary: completion.choices?.[0]?.message?.content,
