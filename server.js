@@ -1,16 +1,18 @@
 /**
- * Cavas Voice Demo (2 modes)
- * MODE=education  -> your existing admissions assistant (LLM)
- * MODE=hospital   -> Medanta-style appointment + department + human handoff (safe, tool/data driven)
+ * Cavas Voice Demo (2 modes + Hindi/English auto-switch for hospital)
+ * MODE=education  -> admissions assistant (LLM)
+ * MODE=hospital   -> appointment + department + human handoff (safe, tool/data driven) + auto Hindi/English
  *
  * Env needed:
- *  - BASE_URL=https://cavas-voice-demo.onrender.com   (or auto from Render)
+ *  - BASE_URL=https://cavas-voice-demo.onrender.com
  *  - MODE=hospital | education
  *  - OPENAI_API_KEY=...
  *  - OPENAI_MODEL=gpt-4o-mini (optional)
  *  - ELEVEN_API_KEY=...
- *  - ELEVEN_VOICE_ID=...
- *  - HOSPITAL_AGENT_NUMBER=+91XXXXXXXXXX  (number to transfer to)
+ *  - ELEVEN_VOICE_ID=... (fallback voice)
+ *  - ELEVEN_VOICE_ID_EN=... (optional)
+ *  - ELEVEN_VOICE_ID_HI=... (optional)
+ *  - HOSPITAL_AGENT_NUMBER=+91XXXXXXXXXX
  *  - HOSPITAL_NAME=Medanta (optional)
  */
 
@@ -26,7 +28,6 @@ const MODE = (process.env.MODE || "education").toLowerCase(); // "education" | "
 const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "Medanta";
 const AGENT_NUMBER = process.env.HOSPITAL_AGENT_NUMBER || ""; // e.g. +919999999999
 
-// Prefer explicit BASE_URL; fallback to request host at runtime when possible
 const BASE_URL = process.env.BASE_URL || "https://cavas-voice-demo.onrender.com";
 
 // ---------- OpenAI ----------
@@ -35,7 +36,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // ---------- Memory Stores ----------
 const convoStore = new Map();      // CallSid -> last 10 messages
 const transcriptStore = new Map(); // CallSid -> full transcript
-const sessionStore = new Map();    // CallSid -> { mode, state, data }
+const sessionStore = new Map();    // CallSid -> { mode, state, lang, data }
 
 function getHistory(callSid) {
   return convoStore.get(callSid) || [];
@@ -60,22 +61,60 @@ function getTranscript(callSid) {
 function getSession(callSid) {
   const s = sessionStore.get(callSid);
   if (s) return s;
-  const fresh = { mode: MODE, state: "NEW", data: {} };
+  const fresh = { mode: MODE, state: "NEW", lang: null, data: {} };
   sessionStore.set(callSid, fresh);
   return fresh;
 }
 function setSession(callSid, patch) {
   const s = getSession(callSid);
-  const next = { ...s, ...patch, data: { ...(s.data || {}), ...(patch.data || {}) } };
+  const next = {
+    ...s,
+    ...patch,
+    data: { ...(s.data || {}), ...(patch.data || {}) },
+  };
   sessionStore.set(callSid, next);
   return next;
 }
 
-// ---------- ElevenLabs TTS ----------
-async function elevenTTS(text) {
+// =========================================================
+// Language helpers (Hindi/English auto-switch for hospital)
+// =========================================================
+function normalize(s) {
+  return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+function containsDevanagari(text) {
+  return /[\u0900-\u097F]/.test(String(text || ""));
+}
+function detectLangPreference(text) {
+  const t = normalize(text);
+  if (containsDevanagari(text)) return "hi-IN";
+
+  if (t.includes("hindi") || t.includes("हिंदी") || t.includes("हिन्दी")) return "hi-IN";
+  if (t.includes("english") || t.includes("अंग्रेजी")) return "en-IN";
+
+  // Default: keep current session language
+  return null;
+}
+function getSttLang(callSid) {
+  const s = getSession(callSid);
+  if ((s.mode || MODE) === "hospital") return s.lang || "en-IN"; // good for India + Hinglish
+  return "en-US";
+}
+
+// =========================================================
+// ElevenLabs TTS (language-aware, optional separate voices)
+// =========================================================
+function getVoiceIdForLang(lang) {
+  const fallback = process.env.ELEVEN_VOICE_ID;
+  if (lang === "hi-IN") return process.env.ELEVEN_VOICE_ID_HI || fallback;
+  return process.env.ELEVEN_VOICE_ID_EN || fallback;
+}
+
+async function elevenTTS(text, lang = "en-IN") {
+  const voiceId = getVoiceIdForLang(lang);
   const r = await axios({
     method: "POST",
-    url: `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVEN_VOICE_ID}`,
+    url: `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
     headers: {
       "xi-api-key": process.env.ELEVEN_API_KEY,
       "Content-Type": "application/json",
@@ -93,7 +132,9 @@ async function elevenTTS(text) {
 
 app.get("/tts", async (req, res) => {
   try {
-    const audio = await elevenTTS(String(req.query.text || ""));
+    const text = String(req.query.text || "");
+    const lang = String(req.query.lang || "en-IN");
+    const audio = await elevenTTS(text, lang);
     res.set("Content-Type", "audio/mpeg");
     res.set("Cache-Control", "no-store");
     res.send(audio);
@@ -188,16 +229,9 @@ const DEPARTMENTS = [
   "Gastroenterology",
 ];
 
-// ---- Helpers: safe matching ----
-function normalize(s) {
-  return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
-}
-
 function extractPhone(text) {
   const t = String(text || "");
-  const m =
-    t.match(/(\+?\d[\d\s-]{9,}\d)/) || // loose
-    t.match(/(\d{10})/);
+  const m = t.match(/(\+?\d[\d\s-]{9,}\d)/) || t.match(/(\d{10})/);
   return m ? m[1].replace(/\s|-/g, "") : null;
 }
 
@@ -210,13 +244,13 @@ function findDoctorByName(query) {
 function listDoctorsByDept(dept, location = "Gurgaon") {
   const d = normalize(dept);
   return DOCTORS.filter(
-    (x) => normalize(x.dept) === d && normalize(x.location) === normalize(location)
+    (x) =>
+      normalize(x.dept) === d && normalize(x.location) === normalize(location)
   );
 }
 
 function detectDept(text) {
   const t = normalize(text);
-  // If user says "cardio", "ortho", etc.
   const aliases = [
     { k: ["cardio", "cardiology", "heart"], v: "Cardiology" },
     { k: ["ortho", "orthopedic", "orthopedics", "bones", "bone"], v: "Orthopedics" },
@@ -229,7 +263,6 @@ function detectDept(text) {
   for (const a of aliases) {
     if (a.k.some((kw) => t.includes(kw))) return a.v;
   }
-  // exact department name
   const direct = DEPARTMENTS.find((d) => t.includes(normalize(d)));
   return direct || null;
 }
@@ -246,43 +279,28 @@ function wantsHuman(text) {
     "transfer",
     "talk to someone",
     "call center",
+    "agent se",
+    "representative se",
+    "human se",
   ].some((k) => t.includes(k));
 }
 
 function looksLikeMedicalAdvice(text) {
-  // Keep conservative: if symptom/diagnosis words appear, route to human
   const t = normalize(text);
   const risky = [
-    "fever",
-    "pain",
-    "chest pain",
-    "breath",
-    "bp",
-    "blood pressure",
-    "diagnose",
-    "diagnosis",
-    "treatment",
-    "medicine",
-    "tablet",
-    "dose",
-    "emergency",
-    "vomit",
-    "bleeding",
-    "pregnant",
-    "pregnancy",
-    "heart attack",
-    "stroke",
+    "fever", "pain", "chest pain", "breath", "bp", "blood pressure",
+    "diagnose", "diagnosis", "treatment", "medicine", "tablet", "dose",
+    "emergency", "vomit", "bleeding", "pregnant", "pregnancy",
+    "heart attack", "stroke",
+    // common Hindi/Hinglish cues:
+    "bukhar", "dard", "saans", "dabav", "blood", "dawai", "medicine", "emergency"
   ];
   return risky.some((k) => t.includes(k));
 }
 
-// ---- Appointment flow state machine ----
-// states: NEW -> (ASK_INTENT) -> (BOOK_DOCTOR / BOOK_DEPT) -> COLLECT_NAME -> COLLECT_PHONE -> COLLECT_TIME -> CONFIRMED
 function summarizeTopDoctors(doctors) {
   const top = doctors.slice(0, 3);
-  return top
-    .map((d, i) => `${i + 1}. ${d.name} (${d.dept})`)
-    .join(". ");
+  return top.map((d, i) => `${i + 1}. ${d.name} (${d.dept})`).join(". ");
 }
 
 function pickSlots(d) {
@@ -292,9 +310,13 @@ function pickSlots(d) {
 }
 
 async function hospitalLLMPolish(callSid, rawReply) {
-  // Optional: keep it short + polite; no medical advice, no invention.
-  // If OpenAI key not set, just return raw.
   if (!process.env.OPENAI_API_KEY) return rawReply;
+
+  const lang = getSttLang(callSid);
+  const style =
+    lang === "hi-IN"
+      ? "Reply in friendly, natural Hindi or Hinglish (Devanagari preferred), like a hospital front-desk. Keep it 1–2 short sentences."
+      : "Reply in friendly, natural English, like a hospital front-desk. Keep it 1–2 short sentences.";
 
   const completion = await openai.chat.completions.create({
     model: process.env.OPENAI_MODEL || "gpt-4o-mini",
@@ -304,8 +326,8 @@ async function hospitalLLMPolish(callSid, rawReply) {
         role: "system",
         content:
           `You are a hospital appointment and routing voice assistant for ${HOSPITAL_NAME}. ` +
-          "You MUST NOT provide medical advice. Only scheduling, departments, and transferring to a human agent. " +
-          "Keep replies 1–2 short sentences, voice-friendly.",
+          "You MUST NOT provide medical advice. Only appointments, departments, doctor options, and transferring to a human agent. " +
+          style,
       },
       { role: "user", content: rawReply },
     ],
@@ -317,11 +339,12 @@ async function hospitalLLMPolish(callSid, rawReply) {
 async function getAIAnswerHospital(callSid, userText) {
   const session = getSession(callSid);
   const t = userText.trim();
+  const norm = normalize(t);
 
-  // Logging transcript (user)
+  // transcript
   pushTranscript(callSid, "user", t);
 
-  // Immediate human handoff triggers
+  // immediate handoff (human request OR medical)
   if (wantsHuman(t) || looksLikeMedicalAdvice(t)) {
     const reason = wantsHuman(t) ? "User requested human agent" : "Medical advice detected";
     const say = await hospitalLLMPolish(
@@ -332,10 +355,7 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, transfer: true, end: true };
   }
 
-  // If user says "appointment" + Dr name OR mentions "Dr"
-  const norm = normalize(t);
-
-  // If session already collecting fields, follow that
+  // state machine
   if (session.state === "COLLECT_NAME") {
     setSession(callSid, { state: "COLLECT_PHONE", data: { patientName: t } });
     const say = await hospitalLLMPolish(callSid, "Thanks. Please tell me your 10-digit mobile number for confirmation.");
@@ -357,9 +377,8 @@ async function getAIAnswerHospital(callSid, userText) {
   }
 
   if (session.state === "COLLECT_TIME") {
-    // Create a dummy appointment request
     const confirmationId = `APT-${Math.random().toString(16).slice(2, 8).toUpperCase()}`;
-    const { patientName, phone, doctorId, doctorName, dept } = session.data || {};
+    const { patientName, phone, doctorName, dept } = session.data || {};
     const preferredTime = t;
 
     setSession(callSid, { state: "CONFIRMED", data: { preferredTime, confirmationId } });
@@ -375,20 +394,19 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  // Fresh intent detection
+  // doctor name flow
   const dept = detectDept(t);
   const hasDr = norm.includes("dr ") || norm.includes("dr.") || norm.includes("doctor ");
 
-  // Doctor-specific booking
   if (hasDr) {
-    // attempt name extraction: take substring after "dr" / "doctor"
     let q = t;
     const idx = norm.indexOf("dr");
     const idx2 = norm.indexOf("doctor");
     if (idx2 >= 0) q = t.slice(idx2 + "doctor".length).trim();
-    else if (idx >= 0) q = t.slice(idx + 2).trim(); // after "dr"
+    else if (idx >= 0) q = t.slice(idx + 2).trim();
 
     const matches = findDoctorByName(q);
+
     if (matches.length === 1) {
       const d = matches[0];
       setSession(callSid, {
@@ -414,7 +432,6 @@ async function getAIAnswerHospital(callSid, userText) {
       return { say, end: false };
     }
 
-    // no match, ask department instead
     setSession(callSid, { state: "ASK_DEPARTMENT", data: {} });
     const say = await hospitalLLMPolish(
       callSid,
@@ -424,7 +441,6 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  // If we are waiting for doctor choice
   if (session.state === "ASK_DOCTOR_CHOICE") {
     const matches = findDoctorByName(t);
     if (matches.length === 1) {
@@ -445,7 +461,7 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  // Department inquiry (list doctors)
+  // department flow
   if (dept) {
     const docs = listDoctorsByDept(dept, "Gurgaon");
     if (!docs.length) {
@@ -465,7 +481,6 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  // If we asked department explicitly
   if (session.state === "ASK_DEPARTMENT") {
     const dpt = detectDept(t);
     if (!dpt) {
@@ -484,7 +499,6 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  // If user says doctor name after department list
   if (session.state === "ASK_BOOK_OR_LIST_MORE") {
     const matches = findDoctorByName(t);
     if (matches.length === 1) {
@@ -505,7 +519,7 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  // Default hospital guidance (no hallucinations)
+  // fallback
   const fallback =
     `I can help with appointments and departments at ${HOSPITAL_NAME}. ` +
     "Say a department like cardiology, say ‘Dr’ followed by the doctor’s name, or say ‘agent’ to connect to a human.";
@@ -529,27 +543,39 @@ async function getAIAnswer(callSid, userText) {
 app.post("/welcome", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
 
-  // Set session mode per-call (can override by query param too)
   const callSid = req.body.CallSid;
+
   const modeFromQuery = (req.query.mode || "").toString().toLowerCase();
-  const mode = modeFromQuery === "hospital" || modeFromQuery === "education" ? modeFromQuery : MODE;
-  setSession(callSid, { mode, state: "NEW", data: {} });
+  const mode =
+    modeFromQuery === "hospital" || modeFromQuery === "education"
+      ? modeFromQuery
+      : MODE;
+
+  // set per-call defaults
+  setSession(callSid, {
+    mode,
+    state: "NEW",
+    lang: mode === "hospital" ? "en-IN" : null,
+    data: {},
+  });
 
   const greeting =
     mode === "hospital"
-      ? `Hello! You’ve reached ${HOSPITAL_NAME} appointment assistance by Cavas AI. You can say a department, a doctor name, or say agent to connect to a representative. How can I help?`
+      ? `Hello! You’ve reached ${HOSPITAL_NAME} appointment assistance by Cavas AI. You can say a department, a doctor name, or say agent to connect to a representative. You can speak in Hindi or English. How can I help?`
       : "Hello! Welcome to Cavas AI admissions assistant. How can I help you today?";
+
+  const sttLang = getSttLang(callSid);
 
   const gather = twiml.gather({
     input: "speech",
     bargeIn: true,
-    language: "en-US",
+    language: sttLang,
     speechTimeout: "auto",
     action: `${BASE_URL}/handle-input`,
     method: "POST",
   });
 
-  gather.play(`${BASE_URL}/tts?text=${encodeURIComponent(greeting)}`);
+  gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(greeting)}`);
 
   res.type("text/xml").send(twiml.toString());
 });
@@ -565,12 +591,22 @@ app.post("/handle-input", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
+  // auto-switch lang for hospital based on user speech
+  const pref = detectLangPreference(speech);
+  if (pref) setSession(callSid, { lang: pref });
+
+  const sttLang = getSttLang(callSid);
+
   const result = await getAIAnswer(callSid, speech);
-  twiml.play(`${BASE_URL}/tts?text=${encodeURIComponent(result.say)}`);
+  twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(result.say)}`);
 
   if (result.transfer) {
     if (!AGENT_NUMBER) {
-      twiml.play(`${BASE_URL}/tts?text=${encodeURIComponent("I cannot transfer right now because the agent number is not configured. Please try again later.")}`);
+      twiml.play(
+        `${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(
+          "I cannot transfer right now because the agent number is not configured. Please try again later."
+        )}`
+      );
       twiml.hangup();
       return res.type("text/xml").send(twiml.toString());
     }
@@ -581,14 +617,14 @@ app.post("/handle-input", async (req, res) => {
   const gather = twiml.gather({
     input: "speech",
     bargeIn: true,
-    language: "en-US",
+    language: sttLang,
     speechTimeout: "auto",
     action: `${BASE_URL}/handle-followup`,
     method: "POST",
   });
 
   gather.play(
-    `${BASE_URL}/tts?text=${encodeURIComponent(
+    `${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(
       "Would you like to ask another question? You can ask now or say no."
     )}`
   );
@@ -604,17 +640,28 @@ app.post("/handle-followup", async (req, res) => {
   const speech = raw.toLowerCase();
 
   if (!speech || ["no", "bye", "thanks", "thank you", "that is all"].some((w) => speech.includes(w))) {
-    twiml.play(`${BASE_URL}/tts?text=${encodeURIComponent("Thank you for calling. Goodbye.")}`);
+    const sttLang = getSttLang(callSid);
+    twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Thank you for calling. Goodbye.")}`);
     twiml.hangup();
     return res.type("text/xml").send(twiml.toString());
   }
 
+  // auto-switch lang for hospital
+  const pref = detectLangPreference(raw);
+  if (pref) setSession(callSid, { lang: pref });
+
+  const sttLang = getSttLang(callSid);
+
   const result = await getAIAnswer(callSid, raw);
-  twiml.play(`${BASE_URL}/tts?text=${encodeURIComponent(result.say)}`);
+  twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(result.say)}`);
 
   if (result.transfer) {
     if (!AGENT_NUMBER) {
-      twiml.play(`${BASE_URL}/tts?text=${encodeURIComponent("I cannot transfer right now because the agent number is not configured. Please try again later.")}`);
+      twiml.play(
+        `${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(
+          "I cannot transfer right now because the agent number is not configured. Please try again later."
+        )}`
+      );
       twiml.hangup();
       return res.type("text/xml").send(twiml.toString());
     }
@@ -625,13 +672,13 @@ app.post("/handle-followup", async (req, res) => {
   const gather = twiml.gather({
     input: "speech",
     bargeIn: true,
-    language: "en-US",
+    language: sttLang,
     speechTimeout: "auto",
     action: `${BASE_URL}/handle-followup`,
     method: "POST",
   });
 
-  gather.play(`${BASE_URL}/tts?text=${encodeURIComponent("Anything else you would like to know?")}`);
+  gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Anything else you would like to know?")}`);
 
   res.type("text/xml").send(twiml.toString());
 });
@@ -661,6 +708,7 @@ app.get("/call-summary/:callSid", async (req, res) => {
   res.json({
     callSid,
     mode: (getSession(callSid)?.mode || MODE),
+    lang: (getSession(callSid)?.lang || null),
     summary: completion.choices?.[0]?.message?.content,
     transcript,
   });
