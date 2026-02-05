@@ -253,7 +253,17 @@ function pickSlots(d) {
 }
 
 async function hospitalLLMPolish(callSid, rawReply) {
-  if (!process.env.OPENAI_API_KEY) return rawReply;
+    // If no OpenAI key, or message is sensitive (name/phone/time collection), skip polish
+  const lower = String(rawReply || "").toLowerCase();
+  const skipPolish =
+    lower.includes("full name") ||
+    lower.includes("mobile number") ||
+    lower.includes("10-digit") ||
+    lower.includes("preferred") ||
+    lower.includes("confirmation id") ||
+    lower.includes("appointment request");
+
+  if (!process.env.OPENAI_API_KEY || skipPolish) return rawReply;
 
   const lang = getSttLang(callSid);
   const style =
@@ -261,16 +271,41 @@ async function hospitalLLMPolish(callSid, rawReply) {
       ? "Reply in friendly, natural Hindi or Hinglish (Devanagari preferred), like a hospital front-desk. Keep it 1–2 short sentences."
       : "Reply in friendly, natural English, like a hospital front-desk. Keep it 1–2 short sentences.";
 
-  const completion = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-    temperature: 0.2,
-    messages: [
-      { role: "system", content: `You are a hospital appointment and routing voice assistant for ${HOSPITAL_NAME}. You MUST NOT provide medical advice. Only appointments, departments, doctor options, and transferring to a human agent. ${style}` },
-      { role: "user", content: rawReply },
-    ],
-  });
+  try {
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content:
+            `You are a hospital appointment and routing voice assistant for ${HOSPITAL_NAME}. ` +
+            "You MUST NOT provide medical advice. " +
+            "You ARE allowed to ask for basic booking details like patient name and phone number for appointment confirmation. " +
+            "Do NOT refuse; do NOT mention policies. " +
+            style,
+        },
+        { role: "user", content: rawReply },
+      ],
+    });
 
-  return completion.choices?.[0]?.message?.content?.trim() || rawReply;
+    const out = completion.choices?.[0]?.message?.content?.trim();
+
+    // If model returns a refusal-like response, fallback to rawReply
+    const refusalHints = [
+      "i can’t", "i can't",
+      "cannot help with personal",
+      "personal details",
+      "privacy",
+      "i’m not able to",
+      "cannot assist with",
+    ];
+    if (!out || refusalHints.some((h) => out.toLowerCase().includes(h))) return rawReply;
+
+    return out;
+  } catch {
+    return rawReply;
+  }
 }
 
 async function getAIAnswerHospital(callSid, userText) {
