@@ -1,6 +1,6 @@
 /**
- * Cavas Voice Demo (2 modes + Hindi/English auto-switch for hospital)
- * MODE=education  -> admissions assistant (LLM)
+ * Cavas Voice Demo (2 modes + Hindi/English auto-switch for hospital + better loop handling)
+ * MODE=education  -> admissions assistant (LLM) with explicit "ask another question" prompts
  * MODE=hospital   -> appointment + department + human handoff (safe, tool/data driven) + auto Hindi/English
  *
  * Env needed:
@@ -34,7 +34,7 @@ const BASE_URL = process.env.BASE_URL || "https://cavas-voice-demo.onrender.com"
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ---------- Memory Stores ----------
-const convoStore = new Map();      // CallSid -> last 10 messages
+const convoStore = new Map();      // CallSid -> last 10 messages (education only)
 const transcriptStore = new Map(); // CallSid -> full transcript
 const sessionStore = new Map();    // CallSid -> { mode, state, lang, data }
 
@@ -88,11 +88,8 @@ function containsDevanagari(text) {
 function detectLangPreference(text) {
   const t = normalize(text);
   if (containsDevanagari(text)) return "hi-IN";
-
   if (t.includes("hindi") || t.includes("हिंदी") || t.includes("हिन्दी")) return "hi-IN";
   if (t.includes("english") || t.includes("अंग्रेजी")) return "en-IN";
-
-  // Default: keep current session language
   return null;
 }
 function getSttLang(callSid) {
@@ -147,7 +144,7 @@ app.get("/tts", async (req, res) => {
 app.get("/", (_, res) => res.send(`Cavas Voice Demo is running ✅ (MODE=${MODE})`));
 
 // =========================================================
-// 1) EDUCATION MODE (your existing behavior)
+// 1) EDUCATION MODE (LLM)
 // =========================================================
 async function getAIAnswerEducation(callSid, userText) {
   const history = getHistory(callSid);
@@ -293,7 +290,7 @@ function looksLikeMedicalAdvice(text) {
     "emergency", "vomit", "bleeding", "pregnant", "pregnancy",
     "heart attack", "stroke",
     // common Hindi/Hinglish cues:
-    "bukhar", "dard", "saans", "dabav", "blood", "dawai", "medicine", "emergency"
+    "bukhar", "dard", "saans", "dabav", "blood", "dawai", "emergency"
   ];
   return risky.some((k) => t.includes(k));
 }
@@ -341,7 +338,6 @@ async function getAIAnswerHospital(callSid, userText) {
   const t = userText.trim();
   const norm = normalize(t);
 
-  // transcript
   pushTranscript(callSid, "user", t);
 
   // immediate handoff (human request OR medical)
@@ -488,11 +484,11 @@ async function getAIAnswerHospital(callSid, userText) {
       pushTranscript(callSid, "assistant", say);
       return { say, end: false };
     }
-    const docs = listDoctorsByDept(dpt, "Gurgaon");
+    listDoctorsByDept(dpt, "Gurgaon"); // just to validate
     setSession(callSid, { state: "ASK_BOOK_OR_LIST_MORE", data: { dept: dpt } });
 
     const base =
-      `${dpt} doctors include ${docs.slice(0, 3).map((d) => d.name).join(", ")}. ` +
+      `${dpt} doctors include ${listDoctorsByDept(dpt, "Gurgaon").slice(0, 3).map((d) => d.name).join(", ")}. ` +
       "Say the doctor’s name to book, or say ‘agent’ to connect to a representative.";
     const say = await hospitalLLMPolish(callSid, base);
     pushTranscript(callSid, "assistant", say);
@@ -519,7 +515,6 @@ async function getAIAnswerHospital(callSid, userText) {
     return { say, end: false };
   }
 
-  // fallback
   const fallback =
     `I can help with appointments and departments at ${HOSPITAL_NAME}. ` +
     "Say a department like cardiology, say ‘Dr’ followed by the doctor’s name, or say ‘agent’ to connect to a human.";
@@ -536,7 +531,7 @@ async function getAIAnswer(callSid, userText) {
 }
 
 // =========================================================
-// Twilio Routes
+// Twilio Routes (fixed: hospital no longer forces generic loop prompts)
 // =========================================================
 
 // ---------- Welcome ----------
@@ -595,11 +590,16 @@ app.post("/handle-input", async (req, res) => {
   const pref = detectLangPreference(speech);
   if (pref) setSession(callSid, { lang: pref });
 
+  // Run brain
+  const result = await getAIAnswer(callSid, speech);
+
+  // Use latest language (in case we switched)
   const sttLang = getSttLang(callSid);
 
-  const result = await getAIAnswer(callSid, speech);
+  // Speak answer
   twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(result.say)}`);
 
+  // Transfer if needed
   if (result.transfer) {
     if (!AGENT_NUMBER) {
       twiml.play(
@@ -614,6 +614,8 @@ app.post("/handle-input", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
+  const mode = (getSession(callSid)?.mode || MODE);
+
   const gather = twiml.gather({
     input: "speech",
     bargeIn: true,
@@ -623,13 +625,21 @@ app.post("/handle-input", async (req, res) => {
     method: "POST",
   });
 
-  gather.play(
-    `${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(
-      "Would you like to ask another question? You can ask now or say no."
-    )}`
-  );
+  if (mode === "education") {
+    gather.play(
+      `${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(
+        "Would you like to ask another question? You can ask now or say no."
+      )}`
+    );
+  } else {
+    const shortPrompt =
+      sttLang === "hi-IN"
+        ? "Aur kuch help chahiye? Aap bol sakte hain."
+        : "Anything else? You can speak now.";
+    gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(shortPrompt)}`);
+  }
 
-  res.type("text/xml").send(twiml.toString());
+  return res.type("text/xml").send(twiml.toString());
 });
 
 // ---------- Follow-up ----------
@@ -637,24 +647,30 @@ app.post("/handle-followup", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const callSid = req.body.CallSid;
   const raw = (req.body.SpeechResult || "").trim();
-  const speech = raw.toLowerCase();
-
-  if (!speech || ["no", "bye", "thanks", "thank you", "that is all"].some((w) => speech.includes(w))) {
-    const sttLang = getSttLang(callSid);
-    twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Thank you for calling. Goodbye.")}`);
-    twiml.hangup();
-    return res.type("text/xml").send(twiml.toString());
-  }
+  const speechLower = raw.toLowerCase();
 
   // auto-switch lang for hospital
   const pref = detectLangPreference(raw);
   if (pref) setSession(callSid, { lang: pref });
 
   const sttLang = getSttLang(callSid);
+  const mode = (getSession(callSid)?.mode || MODE);
+
+  // End words
+  const endWords = ["no", "bye", "thanks", "thank you", "that is all", "nahi", "nahin", "बस", "theek hai"];
+  if (!speechLower || endWords.some((w) => speechLower.includes(w))) {
+    const bye = sttLang === "hi-IN" ? "Dhanyavaad. Alvida." : "Thank you for calling. Goodbye.";
+    twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(bye)}`);
+    twiml.hangup();
+    return res.type("text/xml").send(twiml.toString());
+  }
 
   const result = await getAIAnswer(callSid, raw);
+
+  // Speak answer
   twiml.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(result.say)}`);
 
+  // Transfer if needed
   if (result.transfer) {
     if (!AGENT_NUMBER) {
       twiml.play(
@@ -669,6 +685,7 @@ app.post("/handle-followup", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
+  // Continue gather
   const gather = twiml.gather({
     input: "speech",
     bargeIn: true,
@@ -678,9 +695,17 @@ app.post("/handle-followup", async (req, res) => {
     method: "POST",
   });
 
-  gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Anything else you would like to know?")}`);
+  if (mode === "education") {
+    gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent("Anything else you would like to know?")}`);
+  } else {
+    const shortPrompt =
+      sttLang === "hi-IN"
+        ? "Aur kya jaankari chahiye? Aap bol sakte hain."
+        : "Anything else? You can speak now.";
+    gather.play(`${BASE_URL}/tts?lang=${encodeURIComponent(sttLang)}&text=${encodeURIComponent(shortPrompt)}`);
+  }
 
-  res.type("text/xml").send(twiml.toString());
+  return res.type("text/xml").send(twiml.toString());
 });
 
 // ---------- Call Summary ----------
