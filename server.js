@@ -16,9 +16,63 @@ import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
 import { answerFromKB } from "./kb/answer.mjs";
+import multer from "multer";
+import { extractTextFromBuffer, buildKbFromText } from "./kb/ingest.mjs";
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
+const upload = multer({ storage: multer.memoryStorage() });
+
+// simple admin auth
+function requireAdmin(req, res, next) {
+  const token = req.headers["x-admin-token"] || req.query.token;
+  if (!process.env.ADMIN_TOKEN) {
+    return res.status(500).send("ADMIN_TOKEN not set");
+  }
+  if (token !== process.env.ADMIN_TOKEN) {
+    return res.status(401).send("Unauthorized");
+  }
+  next();
+}
+
+// Upload form (admin)
+app.get("/kb", requireAdmin, (req, res) => {
+  res.type("html").send(`
+    <html>
+      <body style="font-family:system-ui; padding:24px; max-width:720px;">
+        <h2>KB Upload</h2>
+        <p>Upload PDF / DOCX / TXT. This will rebuild kb/kb_vectors.json</p>
+        <form action="/kb/upload?token=${encodeURIComponent(req.query.token || "")}" method="post" enctype="multipart/form-data">
+          <input type="file" name="file" required />
+          <br/><br/>
+          <button type="submit">Upload & Build KB</button>
+        </form>
+      </body>
+    </html>
+  `);
+});
+
+// Upload endpoint (admin)
+app.post("/kb/upload", requireAdmin, upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+    const sourceName = req.file.originalname || "uploaded_file";
+    const text = await extractTextFromBuffer(req.file.buffer, sourceName);
+
+    const result = await buildKbFromText({ sourceName, text });
+
+    return res.json({
+      ok: true,
+      sourceName,
+      extractedChars: text.length,
+      ...result,
+    });
+  } catch (e) {
+    console.error("KB upload failed:", e);
+    return res.status(500).json({ ok: false, error: e?.message || "KB upload failed" });
+  }
+});
 
 const MODE = (process.env.MODE || "education").toLowerCase();
 const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "Medanta";
