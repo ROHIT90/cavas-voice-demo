@@ -15,6 +15,7 @@ import axios from "axios";
 import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
+import { answerFromKB } from "./kb/answer.mjs";
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -335,29 +336,19 @@ app.get("/ui/:callSid", (req, res) => {
 // =========================================================
 // EDUCATION MODE
 // =========================================================
+// =========================================================
+// EDUCATION MODE (KB RAG)
+// =========================================================
 async function getAIAnswerEducation(callSid, userText) {
-  const history = getHistory(callSid);
+  const answer = await answerFromKB(userText);
 
-  const completion = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-    temperature: 0.3,
-    messages: [
-      { role: "system", content: "You are Cavas AI admissions assistant. Answer clearly in 1–3 sentences. Maintain conversation context." },
-      ...history,
-      { role: "user", content: userText },
-    ],
-  });
-
-  const answer = completion.choices?.[0]?.message?.content?.trim() || "Sorry, I could not answer that.";
-
-  pushHistory(callSid, "user", userText);
-  pushHistory(callSid, "assistant", answer);
-
+  // Keep transcript + live UI
   pushTranscript(callSid, "user", userText);
   pushTranscript(callSid, "assistant", answer);
 
   return { say: answer, transfer: false };
 }
+
 
 // =========================================================
 // HOSPITAL MODE
