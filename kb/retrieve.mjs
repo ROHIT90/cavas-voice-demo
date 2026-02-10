@@ -4,7 +4,7 @@ import OpenAI from "openai";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const VEC_PATH = path.join(process.cwd(), "kb", "sksscbs_vectors.json");
+const VEC_PATH = path.join(process.cwd(), "kb", "kb_vectors.json");
 const vectors = JSON.parse(fs.readFileSync(VEC_PATH, "utf8"));
 
 function cosineSim(a, b) {
