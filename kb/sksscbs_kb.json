@@ -1,0 +1,32 @@
+[
+  {
+    "id": "ug_programmes",
+    "title": "UG programmes offered",
+    "text": "SKSSCBS offers B.Com with specializations (Accounting & Finance, Banking & Finance, Financial Markets, Data Analytics) and BBA/BBM/Business Management programmes."
+  },
+  {
+    "id": "pg_programmes",
+    "title": "PG programmes offered",
+    "text": "It offers M.Com (Accounting & Finance), M.Com (Banking & Finance), and Business Management."
+  },
+  {
+    "id": "accreditation",
+    "title": "Accreditation",
+    "text": "The school is NAAC ‘A’-accredited and part of the Somaiya Vidyavihar University system."
+  },
+  {
+    "id": "admission_mode",
+    "title": "Mode of admission",
+    "text": "The admission process and form submission are completely online via admissions.somaiya.edu."
+  },
+  {
+    "id": "hostel",
+    "title": "Hostel facility",
+    "text": "The university campus hosts multiple hostels; students admitted in SKSSCBS can opt for hostel accommodation subject to availability."
+  },
+  {
+    "id": "contact",
+    "title": "Admissions contact",
+    "text": "You can contact via admissions@somaiya.edu or WhatsApp/call on +91 7028233777."
+  }
+]
