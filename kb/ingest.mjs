@@ -1,4 +1,4 @@
-import fs from "fs";
+import fs from "fS";
 import path from "path";
 import * as pdfParse from "pdf-parse";
 import mammoth from "mammoth";
