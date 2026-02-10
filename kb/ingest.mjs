@@ -1,8 +1,9 @@
 import fs from "fs";
 import path from "path";
-import pdfParse from "pdf-parse";
+import * as pdfParse from "pdf-parse";
 import mammoth from "mammoth";
 import OpenAI from "openai";
+
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -15,8 +16,8 @@ export async function extractTextFromBuffer(buffer, originalName = "") {
   const name = originalName.toLowerCase();
 
   if (name.endsWith(".pdf")) {
-    const data = await pdfParse(buffer);
-    return (data.text || "").trim();
+  const data = await pdfParse.default(buffer);
+  return (data.text || "").trim();
   }
 
   if (name.endsWith(".docx")) {
